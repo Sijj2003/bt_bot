@@ -4,6 +4,7 @@ import time
 import base64
 import re
 import threading
+import logging
 from datetime import datetime
 import requests
 from bs4 import BeautifulSoup
@@ -13,6 +14,10 @@ from firebase_admin import credentials, firestore
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Configuración de logs limpia para el Dashboard de Render
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # =========================================================
 # 1. SERVIDOR FLASK (Health Check para Render)
@@ -38,15 +43,15 @@ if firebase_credentials_raw:
             
         cred = credentials.Certificate(cred_dict)
         firebase_admin.initialize_app(cred)
-        print("[FIREBASE] Inicializado correctamente desde variable de entorno.")
+        logger.info("[FIREBASE] Inicializado correctamente desde variable de entorno.")
     except Exception as e:
-        print(f"[FIREBASE ERROR] Error parseando FIREBASE_CREDENTIALS: {e}")
+        logger.error(f"[FIREBASE ERROR] Error parseando FIREBASE_CREDENTIALS: {e}")
         raise e
 else:
     if os.path.exists('serviceAccountKey.json'):
         cred = credentials.Certificate('serviceAccountKey.json')
         firebase_admin.initialize_app(cred)
-        print("[FIREBASE] Inicializado desde serviceAccountKey.json local.")
+        logger.info("[FIREBASE] Inicializado desde serviceAccountKey.json local.")
     else:
         raise ValueError("Falta la variable FIREBASE_CREDENTIALS o el archivo local serviceAccountKey.json.")
 
@@ -63,7 +68,7 @@ if not all([TESORO_SUCURSAL, TESORO_CAJA, TESORO_PASS]):
     raise ValueError("Faltan variables de entorno del Banco del Tesoro (TESORO_SUCURSAL, TESORO_CAJA, TESORO_PASS).")
 
 # =========================================================
-# FUNCIONES AUXILIARES DE FORMATEO (MUY IMPORTANTE)
+# FUNCIONES AUXILIARES DE FORMATEO
 # =========================================================
 def formato_monto_formulario(monto_val):
     """Convierte cualquier monto al formato estricto que exige el formulario del banco (ej. '115,51')"""
@@ -78,7 +83,6 @@ def formato_monto_formulario(monto_val):
         else:
             f_val = float(monto_val)
         
-        # Devuelve string con 2 decimales y coma
         return f"{f_val:.2f}".replace('.', ',')
     except Exception:
         return "0,00"
@@ -87,11 +91,11 @@ def solo_numeros(cadena):
     return re.sub(r'\D', '', str(cadena or ''))
 
 # =========================================================
-# 4. LÓGICA DEL BOT BANCARIO (ESTRATEGIA ZERO TRUST)
+# 4. LÓGICA DEL BOT BANCARIO (ZERO TRUST CORREGIDO)
 # =========================================================
 def procesar_validacion_en_banco(order_id, datos_orden):
     print("\n" + "="*80)
-    print(f"🚀 [INICIO DE PROCESAMIENTO ZERO TRUST] Orden ID: {order_id}")
+    logger.info(f"🚀 [INICIO DE PROCESAMIENTO ZERO TRUST] Orden ID: {order_id}")
     print("="*80)
 
     session = requests.Session()
@@ -116,17 +120,12 @@ def procesar_validacion_en_banco(order_id, datos_orden):
         telefono_orden = str(payment_details.get('telefono', '')).strip()
         monto_orden_raw = payment_details.get('monto_bot', '')
         
-        # Preparar para el formulario
         ref_6_digitos = str(referencia_raw).strip().zfill(6)[-6:]
         monto_form = formato_monto_formulario(monto_orden_raw)
         tel_form = solo_numeros(telefono_orden)
         banco_form = solo_numeros(banco_orden)
 
-        print("\n[DATOS PREPARADOS PARA FORMULARIO DEL BANCO]:")
-        print(f"  • Ref (6 dígitos): '{ref_6_digitos}'")
-        print(f"  • Monto: '{monto_form}'")
-        print(f"  • Teléfono: '{tel_form}'")
-        print(f"  • Banco: '{banco_form}'")
+        logger.info(f"[DATOS FORMULARIO]: Ref='{ref_6_digitos}' | Monto='{monto_form}' | Tel='{tel_form}' | Banco='{banco_form}'")
 
         if not ref_6_digitos or monto_form == "0,00":
             raise Exception("Datos insuficientes en la orden (Falta referencia o monto).")
@@ -134,7 +133,7 @@ def procesar_validacion_en_banco(order_id, datos_orden):
         session.cookies.clear()
         
         # --- PASO 1: LOGIN ---
-        print("\n[PASO 1] Entrando a Login...")
+        logger.info("[PASO 1] Entrando a Login...")
         res_get = session.get('https://tesoropagos.bt.com.ve/login', timeout=15)
         soup = BeautifulSoup(res_get.text, 'html.parser')
         
@@ -152,7 +151,7 @@ def procesar_validacion_en_banco(order_id, datos_orden):
 
         time.sleep(1)
         
-        print("[PASO 1] Iniciando sesión...")
+        logger.info("[PASO 1] Enviando credenciales...")
         session.headers.update({'Referer': 'https://tesoropagos.bt.com.ve/login'})
         res_login = session.post('https://tesoropagos.bt.com.ve/login', data=payload_login, allow_redirects=False, timeout=15)
         
@@ -160,18 +159,18 @@ def procesar_validacion_en_banco(order_id, datos_orden):
         if res_login.status_code != 302 or 'login' in location:
             raise Exception("Credenciales del banco rechazadas o sesión bloqueada.")
             
-        print("  ✅ Login exitoso.")
+        logger.info("  ✅ Login exitoso.")
         
         # --- PASO 2: OBTENER TOKEN DE VALIDACIÓN ---
-        print("\n[PASO 2] Extrayendo CSRF de Pago Móvil...")
+        logger.info("[PASO 2] Extrayendo CSRF de Pago Móvil...")
         res_dash = session.get('https://tesoropagos.bt.com.ve/pago-movil', timeout=15)
         soup_dash = BeautifulSoup(res_dash.text, 'html.parser')
         meta_token = soup_dash.find('meta', {'name': 'csrf-token'})
         api_token = meta_token['content'] if meta_token else payload_login.get('_token')
         api_token_global = api_token
 
-        # --- PASO 3: ENVIAR FORMULARIO DE VALIDACIÓN (CON CABECERAS AJAX) ---
-        print("\n[PASO 3] Enviando datos al motor de verificación del banco...")
+        # --- PASO 3: ENVIAR FORMULARIO DE VALIDACIÓN ---
+        logger.info("[PASO 3] Enviando consulta al banco...")
         payload_validacion = {
             '_token': api_token,
             'monto': monto_form,
@@ -190,57 +189,64 @@ def procesar_validacion_en_banco(order_id, datos_orden):
         
         res_val = session.post('https://tesoropagos.bt.com.ve/pago-movil', data=payload_validacion, allow_redirects=True, timeout=15)
         
-        # --- PASO 4: INTERPRETACIÓN (JSON O HTML) ---
-        print("\n[PASO 4] Analizando dictamen del banco...")
+        # --- PASO 4: INTERPRETACIÓN MEJORADA ---
+        logger.info("[PASO 4] Analizando dictamen del banco...")
         
         texto_analizar = ""
         try:
-            # Intentar parsear respuesta JSON si el banco la devuelve
             data_json = res_val.json()
-            print(f"  [RESPUESTA JSON DEL BANCO]: {json.dumps(data_json, ensure_ascii=False)}")
+            logger.info(f"  [RESPUESTA JSON]: {json.dumps(data_json, ensure_ascii=False)}")
             texto_analizar = json.dumps(data_json).lower()
         except Exception:
-            # Si responde HTML, buscar alertas o toasts específicos
             soup_res = BeautifulSoup(res_val.text, 'html.parser')
-            
-            # Buscar elementos de alerta o mensajes emergentes
             alertas = soup_res.find_all(class_=re.compile(r'alert|toast|swal|invalid-feedback|message', re.I))
             if alertas:
                 mensajes_alertas = [a.get_text(strip=True) for a in alertas]
                 texto_analizar = " ".join(mensajes_alertas).lower()
-                print(f"  [ALERTAS DETECTADAS EN HTML]: {mensajes_alertas}")
+                logger.info(f"  [ALERTAS DETECTADAS EN HTML]: {mensajes_alertas}")
             else:
                 texto_analizar = res_val.text.lower()
 
-        # Evaluación de dictamen
-        if any(w in texto_analizar for w in ["exitoso", "aprobado", "verificado", "true", "success"]):
-            resultado_final = {"status": "APROBADO", "mensaje": "Pago validado y consumido exitosamente por el banco."}
-            print("  🎉 DICTAMEN: Aprobado.")
-            
-        elif any(w in texto_analizar for w in ["ya utilizad", "ya procesad", "repetid", "ya ha sido procesada"]):
-            resultado_final = {"status": "YA_UTILIZADO", "mensaje": "Fraude prevenido: Esta referencia ya fue cobrada y validada anteriormente."}
-            print("  🚨 DICTAMEN: Rechazado (Referencia repetida / ya procesada).")
-            
-        elif any(w in texto_analizar for w in ["no encontrad", "inválid", "rechazad", "no coincide", "error"]):
-            resultado_final = {"status": "NO_ENCONTRADO", "mensaje": "El banco no encontró ningún pago que coincida con estos datos exactos."}
-            print("  🚫 DICTAMEN: Rechazado (No encontrado o datos inválidos).")
-            
+        # EVALUACIÓN DE DICTAMEN (CORREGIDO CON PRIORIDAD)
+        # 1. Primero evaluar si ya fue utilizado/confirmado
+        if any(w in texto_analizar for w in ["confirmado", "ya fue confirmad", "ya utilizad", "ya procesad", "repetid"]):
+            resultado_final = {
+                "status": "YA_UTILIZADO", 
+                "mensaje": "Fraude prevenido: Esta referencia ya fue confirmada o procesada anteriormente."
+            }
+            logger.warning("  🚨 DICTAMEN: Rechazado (Referencia ya confirmada / repetida).")
+
+        # 2. Evaluar aprobación
+        elif any(w in texto_analizar for w in ["exitoso", "aprobado", "verificado", "true", "success"]):
+            resultado_final = {
+                "status": "APROBADO", 
+                "mensaje": "Pago validado y consumido exitosamente por el banco."
+            }
+            logger.info("  🎉 DICTAMEN: Aprobado.")
+
+        # 3. Evaluar no encontrado
+        elif any(w in texto_analizar for w in ["no encontrad", "inválid", "rechazad", "no coincide", "no coinciden", "error"]):
+            resultado_final = {
+                "status": "NO_ENCONTRADO", 
+                "mensaje": "El banco no encontró ningún pago que coincida con estos datos exactos."
+            }
+            logger.warning("  🚫 DICTAMEN: Rechazado (No encontrado o datos inválidos).")
+
         else:
             soup_res = BeautifulSoup(res_val.text, 'html.parser')
             texto_limpio = soup_res.get_text(separator=' | ', strip=True)
-            print("\n  ⚠️ [ALERTA] Respuesta desconocida del banco. Texto extraído:")
-            print(f"  {texto_limpio[:500]}...")
+            logger.error(f"  ⚠️ [ALERTA] Respuesta desconocida: {texto_limpio[:300]}")
             resultado_final = {"status": "DESCONOCIDO", "mensaje": f"Respuesta no estándar: {texto_limpio[:150]}"}
              
     except Exception as e:
-        print(f"\n❌ [BOT EXCEPCIÓN] Error procesando la orden: {e}")
+        logger.error(f"❌ [BOT EXCEPCIÓN] Error procesando la orden: {e}")
         resultado_final = {"status": "ERROR", "mensaje": str(e)}
         
     finally:
-        # --- PASO 5: LOGOUT ---
+        # --- PASO 5: LOGOUT SEGURO ---
         if api_token_global:
             try:
-                print("\n[PASO 5] Cerrando sesión bancaria de forma segura...")
+                logger.info("[PASO 5] Cerrando sesión bancaria...")
                 session.headers.update({
                     'Accept': 'text/html', 
                     'Content-Type': 'application/x-www-form-urlencoded', 
@@ -248,7 +254,7 @@ def procesar_validacion_en_banco(order_id, datos_orden):
                 })
                 session.post('https://tesoropagos.bt.com.ve/logout', data={'_token': api_token_global}, allow_redirects=False, timeout=5)
             except Exception as e:
-                print(f"[PASO 5 ERROR] Error cerrando sesión: {e}")
+                logger.error(f"[PASO 5 ERROR] Error cerrando sesión: {e}")
                 
     # --- PASO 6: ACTUALIZAR FIRESTORE ---
     try:
@@ -260,23 +266,23 @@ def procesar_validacion_en_banco(order_id, datos_orden):
                 'bot_verification_msg': resultado_final['mensaje'],
                 'verified_at': firestore.SERVER_TIMESTAMP
             })
-            print(f"\n✅ [FIRESTORE] Orden {order_id} actualizada a 'approved'.")
+            logger.info(f"✅ [FIRESTORE] Orden {order_id} actualizada a 'approved'.")
             
         elif resultado_final['status'] in ['YA_UTILIZADO', 'NO_ENCONTRADO']:
             order_ref.update({
                 'status': 'rejected',
                 'bot_verification_msg': resultado_final['mensaje']
             })
-            print(f"\n🛡️ [FIRESTORE] Orden {order_id} rechazada por seguridad ({resultado_final['status']}).")
+            logger.info(f"🛡️ [FIRESTORE] Orden {order_id} actualizada a 'rejected' ({resultado_final['status']}).")
             
         else:
             order_ref.update({
                 'bot_verification_msg': f"Error/Revisión Manual: {resultado_final['mensaje']}"
             })
-            print(f"\n⚠️ [FIRESTORE] Mensaje técnico guardado. Requiere revisión manual para la orden {order_id}.")
+            logger.warning(f"⚠️ [FIRESTORE] Estado técnico guardado para revisión manual en la orden {order_id}.")
             
     except Exception as e:
-        print(f"❌ [FIRESTORE ERROR] Falló la actualización de la orden {order_id}: {e}")
+        logger.error(f"❌ [FIRESTORE ERROR] Falló la actualización de la orden {order_id}: {e}")
 
     print("="*80 + "\n")
 
@@ -288,7 +294,7 @@ def on_snapshot(col_snapshot, changes, read_time):
         if change.type.name == 'ADDED':
             order_id = change.document.id
             order_data = change.document.to_dict()
-            print(f"⚡ [FIRESTORE EVENT] Nueva orden pendiente detectada: {order_id}")
+            logger.info(f"⚡ [FIRESTORE EVENT] Nueva orden pendiente detectada: {order_id}")
             
             threading.Thread(
                 target=procesar_validacion_en_banco, 
@@ -297,13 +303,14 @@ def on_snapshot(col_snapshot, changes, read_time):
 
 def start_firestore_listener():
     try:
-        print("🚀 [BOT] Iniciando Listener en tiempo real para colección 'store_orders'...")
+        logger.info("🚀 [BOT] Iniciando Listener en tiempo real para colección 'store_orders'...")
         orders_ref = db.collection('store_orders').where('status', '==', 'pending_verification')
         orders_ref.on_snapshot(on_snapshot)
-        print("✅ [BOT] Listener de Firestore activo y escuchando compras pendientes.")
+        logger.info("✅ [BOT] Listener de Firestore activo y escuchando compras pendientes.")
     except Exception as e:
-        print(f"❌ [BOT ERROR] Falló al iniciar el Listener de Firestore: {e}")
+        logger.error(f"❌ [BOT ERROR] Falló al iniciar el Listener de Firestore: {e}")
 
+# SE INICIA EL LISTENER AL CARGAR EL MÓDULO (Para que funcione con Gunicorn en Render)
 start_firestore_listener()
 
 if __name__ == '__main__':
