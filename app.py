@@ -1,157 +1,188 @@
-import os
-import time
+from flask import Flask, request, jsonify
 import requests
 from bs4 import BeautifulSoup
 import threading
-import json
-import firebase_admin
-from firebase_admin import credentials, firestore
-from flask import Flask
+import os
+import time
+from datetime import datetime
 
-# ==========================================
-# 1. INICIALIZAR FIREBASE EN EL BOT
-# ==========================================
-# Leemos el JSON de Firebase desde una variable de entorno segura en Render
-firebase_creds_json = os.environ.get("FIREBASE_JSON")
-cred = credentials.Certificate(json.loads(firebase_creds_json))
-firebase_admin.initialize_app(cred)
-db = firestore.client()
+app = Flask(__name__)
 
-SUCURSAL = os.environ.get("TESORO_SUCURSAL", "01334301")
-CAJA = os.environ.get("TESORO_CAJA", "03")
-PASSWORD = os.environ.get("TESORO_PASS", "31103356")
+# =========================================================
+# CONFIGURACIÓN (Variables de entorno de Render)
+# =========================================================
+# Reemplaza la URL de abajo con la URL de tu backend en PythonAnywhere si es diferente
+API_BACKEND_URL = os.environ.get("API_BACKEND_URL", "https://sijj2003.pythonanywhere.com")
+BOT_SECRET_KEY = os.environ.get("BOT_SECRET", "Gymenez2026Secure")
+TESORO_SUCURSAL = os.environ.get("TESORO_SUCURSAL", "01334301")
+TESORO_CAJA = os.environ.get("TESORO_CAJA", "03")
+TESORO_PASS = os.environ.get("TESORO_PASS", "31103356")
 
-# ==========================================
-# 2. FUNCIÓN DE VERIFICACIÓN DEL BANCO
-# ==========================================
-def verificar_pago_tesoro(sucursal, caja, password, datos_pago):
+# =========================================================
+# LÓGICA DEL BOT BANCARIO
+# =========================================================
+def procesar_validacion_en_banco(datos_orden):
+    """
+    Se ejecuta en un hilo separado. 
+    Inicia sesión, verifica la referencia en la API del banco y envía el resultado a PythonAnywhere.
+    """
     session = requests.Session()
     session.headers.update({
-        'User-Agent': 'Mozilla/5.0',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Encoding': 'gzip, deflate',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        'Accept-Encoding': 'gzip, deflate, br, zstd',
         'Accept-Language': 'es-ES,es;q=0.9',
         'Connection': 'keep-alive',
         'Upgrade-Insecure-Requests': '1'
     })
-
+    
     api_token_global = None
+    resultado_final = {"status": "ERROR", "mensaje": "Fallo desconocido durante la ejecución del bot."}
 
     try:
+        print(f"[BOT] Iniciando proceso para la orden {datos_orden.get('id_pedido')}...")
         session.cookies.clear()
         
-        # 1. LOGIN
-        response_get = session.get('https://tesoropagos.bt.com.ve/login')
-        soup = BeautifulSoup(response_get.text, 'html.parser')
+        # --- PASO 1: LOGIN ---
+        print("[BOT] Solicitando página de login...")
+        res_get = session.get('https://tesoropagos.bt.com.ve/login')
+        soup = BeautifulSoup(res_get.text, 'html.parser')
         
         payload_login = {}
-        for hidden_input in soup.find_all('input', type='hidden'):
-            if hidden_input.get('name'):
-                payload_login[hidden_input.get('name')] = hidden_input.get('value', '')
+        for inp in soup.find_all('input', type='hidden'):
+            if inp.get('name'):
+                payload_login[inp.get('name')] = inp.get('value', '')
+                
+        payload_login['security_code'] = TESORO_SUCURSAL
+        payload_login['box_number'] = TESORO_CAJA
+        payload_login['password'] = TESORO_PASS
         
-        if '_token' not in payload_login:
-            return {"status": "ERROR", "mensaje": "Fallo obteniendo token CSRF."}
-
-        payload_login['security_code'] = sucursal
-        payload_login['box_number'] = caja
-        payload_login['password'] = password
+        time.sleep(1) # Breve pausa para no saturar al banco
         
+        print("[BOT] Enviando credenciales...")
         session.headers.update({'Referer': 'https://tesoropagos.bt.com.ve/login'})
-        response_login = session.post('https://tesoropagos.bt.com.ve/login', data=payload_login, allow_redirects=False)
+        res_login = session.post('https://tesoropagos.bt.com.ve/login', data=payload_login, allow_redirects=False)
         
-        location = response_login.headers.get('Location', '')
-        if response_login.status_code != 302 or 'login' in location:
-            return {"status": "ERROR", "mensaje": "Credenciales inválidas."}
+        location = res_login.headers.get('Location', '')
+        if res_login.status_code != 302 or 'login' in location:
+            raise Exception("Credenciales inválidas, usuario bloqueado, o sesión atorada en el banco.")
+            
+        print("[BOT] Login exitoso. Preparando API...")
         
-        # 2. PREPARAR VALIDACIÓN
-        response_dash = session.get('https://tesoropagos.bt.com.ve/pago-movil')
-        soup_dash = BeautifulSoup(response_dash.text, 'html.parser')
+        # --- PASO 2: OBTENER TOKEN PARA API ---
+        res_dash = session.get('https://tesoropagos.bt.com.ve/pago-movil')
+        soup_dash = BeautifulSoup(res_dash.text, 'html.parser')
         meta_token = soup_dash.find('meta', {'name': 'csrf-token'})
-        api_token = meta_token['content'] if meta_token else payload_login['_token']
+        api_token = meta_token['content'] if meta_token else payload_login.get('_token')
         api_token_global = api_token
         
-        # 3. ENVIAR FORMULARIO AL BANCO (Usamos la estructura de tu nuevo backend)
-        detalles = datos_pago.get('payment_details', {})
-        payload_validacion = {
-            '_token': api_token,
-            'monto': detalles.get('monto_bot', ''),
-            'banco': detalles.get('banco', ''),
-            'telefono': detalles.get('telefono', ''),
-            'referencia': str(detalles.get('referencia', ''))[-6:]
+        # --- PASO 3: CONSULTAR API DE MOVIMIENTOS ---
+        print("[BOT] Consultando movimientos en el banco...")
+        hoy = datetime.now().strftime("%d/%m/%Y")
+        
+        payload_api = {
+            "fechaDesde": hoy,
+            "fechaHasta": hoy
         }
         
-        session.headers.update({'Referer': 'https://tesoropagos.bt.com.ve/pago-movil', 'Content-Type': 'application/x-www-form-urlencoded'})
-        response_validacion = session.post('https://tesoropagos.bt.com.ve/pago-movil', data=payload_validacion, allow_redirects=True)
-        html_respuesta = response_validacion.text.lower()
+        session.headers.update({
+            'Accept': 'application/json, text/plain, */*',
+            'Content-Type': 'application/json',
+            'X-CSRF-TOKEN': api_token,
+            'X-Requested-With': 'XMLHttpRequest',
+            'Referer': 'https://tesoropagos.bt.com.ve/pago-movil'
+        })
         
-        # 4. LOGOUT SEGURO
-        session.headers.update({'Accept': 'text/html', 'Content-Type': 'application/x-www-form-urlencoded', 'X-Requested-With': None})
-        session.post('https://tesoropagos.bt.com.ve/logout', data={'_token': api_token}, allow_redirects=False)
+        res_api = session.post('https://tesoropagos.bt.com.ve/pago-movil/movimientos', json=payload_api)
         
-        # 5. PARSEO
-        if "se validó el pago de forma exitosa" in html_respuesta or "se valido el pago de forma exitosa" in html_respuesta:
-             return {"status": "APROBADO", "mensaje": "Pago verificado exitosamente."}
-        elif "este pago ya fue confirmado anteriormente" in html_respuesta or "ya utilizad" in html_respuesta:
-             return {"status": "YA_UTILIZADO", "mensaje": "La referencia ya fue usada."}
-        elif "no encontrad" in html_respuesta or "inválid" in html_respuesta or "rechazad" in html_respuesta:
-             return {"status": "NO_ENCONTRADO", "mensaje": "Los datos no coinciden."}
+        if res_api.status_code != 200:
+             raise Exception(f"La API del banco devolvió error HTTP {res_api.status_code}.")
+             
+        movimientos = res_api.json()
+        
+        # --- PASO 4: BUSCAR REFERENCIA ---
+        print("[BOT] Analizando JSON de respuesta...")
+        referencia_a_buscar = str(datos_orden.get('referencia', ''))[-6:] # Aseguramos buscar últimos 6 dígitos
+        pago_encontrado = None
+        
+        # Extraemos la lista de movimientos dependiendo de cómo la devuelva el banco
+        lista_movs = movimientos if isinstance(movimientos, list) else movimientos.get('data', []) if isinstance(movimientos, dict) else []
+        
+        for mov in lista_movs:
+            if isinstance(mov, dict) and 'referencia' in mov:
+                ref_banco = str(mov.get('referencia', '')).strip().lstrip('0')
+                ref_orden = str(referencia_a_buscar).strip().lstrip('0')
+                if ref_banco == ref_orden:
+                    pago_encontrado = mov
+                    break
+        
+        if pago_encontrado:
+             # Opcional: Podrías verificar también el monto aquí si el JSON lo incluye.
+             resultado_final = {"status": "APROBADO", "mensaje": "Pago verificado exitosamente en los movimientos de hoy."}
+             print("[BOT] ¡Referencia Encontrada!")
         else:
-             return {"status": "NO_ENCONTRADO", "mensaje": "Respuesta desconocida del banco."}
-
+             resultado_final = {"status": "NO_ENCONTRADO", "mensaje": f"La referencia no figura en los movimientos de hoy del banco."}
+             print("[BOT] Referencia NO encontrada.")
+             
     except Exception as e:
+        print(f"[BOT ERROR] {e}")
+        resultado_final = {"status": "ERROR", "mensaje": str(e)}
+        
+    finally:
+        # --- PASO 5: LOGOUT SEGURO ---
         if api_token_global:
-            session.headers.update({'Accept': 'text/html', 'Content-Type': 'application/x-www-form-urlencoded', 'X-Requested-With': None})
-            session.post('https://tesoropagos.bt.com.ve/logout', data={'_token': api_token_global}, allow_redirects=False)
-        return {"status": "ERROR", "mensaje": str(e)}
-
-# ==========================================
-# 3. EL LISTENER (EL VIGILANTE DE FIREBASE)
-# ==========================================
-def on_snapshot(doc_snapshot, changes, read_time):
-    for change in changes:
-        if change.type.name in ['ADDED', 'MODIFIED']:
-            doc = change.document
-            pago = doc.to_dict()
-            
-            # Buscamos el estado exacto que configuraste en tu backend de PythonAnywhere
-            if pago.get('status') == 'pending_verification' and pago.get('payment_method') == 'pago_movil':
-                print(f"🔔 ¡Nuevo pago detectado! Pedido: {doc.id}")
+            try:
+                print("[BOT] Cerrando sesión bancaria...")
+                session.headers.update({'Accept': 'text/html', 'Content-Type': 'application/x-www-form-urlencoded', 'X-Requested-With': None})
+                session.post('https://tesoropagos.bt.com.ve/logout', data={'_token': api_token_global}, allow_redirects=False)
+            except Exception as e:
+                print(f"[BOT ERROR LOGOUT] No se pudo cerrar la sesión: {e}")
                 
-                resultado_banco = verificar_pago_tesoro(SUCURSAL, CAJA, PASSWORD, pago)
-                print(f"🏦 Resultado del banco para {doc.id}: {resultado_banco['status']}")
-                
-                # Mapeamos la respuesta al formato de tu base de datos
-                status_final = "approved" if resultado_banco['status'] == "APROBADO" else "rejected"
-                
-                doc.reference.update({
-                    'status': status_final,
-                    'bot_verification_msg': resultado_banco.get('mensaje', ''),
-                    'verified_at': firestore.SERVER_TIMESTAMP
-                })
-                print(f"✅ Pedido {doc.id} actualizado en Firebase a {status_final}.")
-                time.sleep(3)
+    # --- PASO 6: ENVIAR RESPUESTA FINAL A PYTHONANYWHERE ---
+    print(f"[BOT] Enviando webhook de regreso a {API_BACKEND_URL}...")
+    try:
+        requests.post(
+            f"{API_BACKEND_URL}/api/store/bot/update",
+            json={
+                "id_pedido": datos_orden['id_pedido'], 
+                "status": resultado_final['status'], 
+                "mensaje": resultado_final['mensaje']
+            },
+            headers={"X-Bot-Secret": BOT_SECRET_KEY},
+            timeout=10 # Aquí sí podemos esperar a que PythonAnywhere conteste
+        )
+        print("[BOT] Proceso finalizado.")
+    except Exception as e:
+        print(f"[BOT ERROR WEBHOOK] Falló el envío a PythonAnywhere: {e}")
 
-def iniciar_vigilancia():
-    print("🚀 Bot Vigilante de Firebase INICIADO.")
-    query = db.collection('store_orders').where('status', '==', 'pending_verification')
-    query_watch = query.on_snapshot(on_snapshot)
-    while True:
-        time.sleep(3600)
+# ====================================================================
+# ENDPOINT WEBHOOK (Escucha las peticiones de PythonAnywhere)
+# ====================================================================
+@app.route('/webhook/verificar', methods=['POST'])
+def recibir_orden():
+    # Seguridad: Solo tu backend puede llamar a este bot
+    if request.headers.get("X-Bot-Secret") != BOT_SECRET_KEY:
+        print("[WEBHOOK] Acceso denegado. Secreto incorrecto.")
+        return jsonify({"error": "No autorizado"}), 401
+        
+    datos_orden = request.json
+    
+    if not datos_orden or 'id_pedido' not in datos_orden:
+        return jsonify({"error": "Datos inválidos"}), 400
+        
+    print(f"[WEBHOOK] Recibida orden {datos_orden['id_pedido']} para verificar referencia {datos_orden.get('referencia')}")
+    
+    # Lanzar hilo en segundo plano (No bloquea a PythonAnywhere)
+    threading.Thread(target=procesar_validacion_en_banco, args=(datos_orden,)).start()
+    
+    # Responder Inmediatamente
+    return jsonify({"success": True, "mensaje": "Bot iniciado y trabajando en segundo plano"}), 200
 
-# ==========================================
-# 4. SERVIDOR FLASK (PARA MANTENER RENDER ACTIVO)
-# ==========================================
-app = Flask(__name__)
-
-@app.route('/')
-def keep_alive():
-    return "✅ El Bot de Gymenez está vivo y vigilando Firebase en las sombras."
+# Ruta de Salud (Para que Render sepa que el servidor está vivo)
+@app.route('/', methods=['GET'])
+def health_check():
+    return "Gymenez Bot is Running!", 200
 
 if __name__ == '__main__':
-    # Arrancamos el vigilante en segundo plano
-    hilo_bot = threading.Thread(target=iniciar_vigilancia, daemon=True)
-    hilo_bot.start()
-    
-    # Arrancamos Flask en el puerto que exige Render
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
