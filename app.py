@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import base64
 import threading
 from datetime import datetime
 import requests
@@ -8,7 +9,9 @@ from bs4 import BeautifulSoup
 from flask import Flask
 import firebase_admin
 from firebase_admin import credentials, firestore
+from google.cloud.firestore_v1.base_query import FieldFilter
 from dotenv import load_dotenv
+from zoneinfo import ZoneInfo
 
 load_dotenv()
 
@@ -28,7 +31,13 @@ firebase_credentials_raw = os.environ.get('FIREBASE_CREDENTIALS')
 
 if firebase_credentials_raw:
     try:
-        cred_dict = json.loads(firebase_credentials_raw)
+        # Intenta decodificar si viene codificado en Base64
+        if not firebase_credentials_raw.strip().startswith('{'):
+            decoded_bytes = base64.b64decode(firebase_credentials_raw)
+            cred_dict = json.loads(decoded_bytes.decode('utf-8'))
+        else:
+            cred_dict = json.loads(firebase_credentials_raw)
+            
         cred = credentials.Certificate(cred_dict)
         firebase_admin.initialize_app(cred)
         print("[FIREBASE] Inicializado correctamente desde variable de entorno.")
@@ -74,7 +83,10 @@ def procesar_validacion_en_banco(order_id, datos_orden):
 
     try:
         referencia_raw = datos_orden.get('referencia') or datos_orden.get('reference') or ''
-        print(f"[BOT] Procesando orden {order_id} con referencia: {referencia_raw}...")
+        # Obtener los últimos 6 dígitos limpios
+        referencia_6_digitos = str(referencia_raw).strip().zfill(6)[-6:]
+        
+        print(f"[BOT] Procesando orden {order_id}. Buscando últimos 6 dígitos: '{referencia_6_digitos}'...")
         session.cookies.clear()
         
         # --- PASO 1: LOGIN ---
@@ -110,9 +122,10 @@ def procesar_validacion_en_banco(order_id, datos_orden):
         api_token = meta_token['content'] if meta_token else payload_login.get('_token')
         api_token_global = api_token
         
-        # --- PASO 3: CONSULTAR API DE MOVIMIENTOS ---
+        # --- PASO 3: CONSULTAR API DE MOVIMIENTOS (ZONA HORARIA CARACAS) ---
         print("[BOT] Consultando movimientos en el banco...")
-        hoy = datetime.now().strftime("%d/%m/%Y")
+        tz_ve = ZoneInfo("America/Caracas")
+        hoy = datetime.now(tz_ve).strftime("%d/%m/%Y")
         
         payload_api = {
             "fechaDesde": hoy,
@@ -133,28 +146,39 @@ def procesar_validacion_en_banco(order_id, datos_orden):
              raise Exception(f"La API del banco devolvió error HTTP {res_api.status_code}.")
              
         movimientos = res_api.json()
+        print(f"[BOT DEBUG] Respuesta raw del banco: {json.dumps(movimientos, ensure_ascii=False)}")
         
         # --- PASO 4: BUSCAR REFERENCIA ---
         print("[BOT] Analizando movimientos del día...")
-        referencia_a_buscar = str(referencia_raw)[-6:]
         pago_encontrado = None
         
         lista_movs = movimientos if isinstance(movimientos, list) else movimientos.get('data', []) if isinstance(movimientos, dict) else []
         
         for mov in lista_movs:
-            if isinstance(mov, dict) and 'referencia' in mov:
-                ref_banco = str(mov.get('referencia', '')).strip().lstrip('0')
-                ref_orden = str(referencia_a_buscar).strip().lstrip('0')
-                if ref_banco == ref_orden:
-                    pago_encontrado = mov
-                    break
+            if isinstance(mov, dict):
+                # Extraer referencia probando diferentes nombres de campos posibles
+                ref_banco_raw = str(
+                    mov.get('referencia') or 
+                    mov.get('numReferencia') or 
+                    mov.get('nroReferencia') or 
+                    mov.get('secuencia') or ''
+                ).strip()
+                
+                if ref_banco_raw:
+                    # Extraer únicamente los últimos 6 dígitos de la referencia recibida del banco
+                    ref_banco_6 = ref_banco_raw.zfill(6)[-6:]
+                    print(f"[BOT DEBUG] Comparando -> Banco: '{ref_banco_raw}' (últimos 6: '{ref_banco_6}') vs Orden: '{referencia_6_digitos}'")
+                    
+                    if ref_banco_6 == referencia_6_digitos:
+                        pago_encontrado = mov
+                        break
         
         if pago_encontrado:
              resultado_final = {"status": "APROBADO", "mensaje": "Pago verificado exitosamente en los movimientos de hoy."}
-             print(f"[BOT] ¡Referencia {referencia_a_buscar} encontrada para orden {order_id}!")
+             print(f"[BOT] ¡Referencia {referencia_6_digitos} encontrada para orden {order_id}!")
         else:
              resultado_final = {"status": "NO_ENCONTRADO", "mensaje": "La referencia no figura en los movimientos bancarios de hoy."}
-             print(f"[BOT] Referencia {referencia_a_buscar} NO encontrada.")
+             print(f"[BOT] Referencia {referencia_6_digitos} NO encontrada.")
              
     except Exception as e:
         print(f"[BOT ERROR] {e}")
@@ -216,7 +240,7 @@ def on_snapshot(col_snapshot, changes, read_time):
 
 def start_firestore_listener():
     print("🚀 [BOT] Iniciando Listener en tiempo real para colección 'store_orders' (status == pending_verification)...")
-    orders_ref = db.collection('store_orders').where('status', '==', 'pending_verification')
+    orders_ref = db.collection('store_orders').where(filter=FieldFilter('status', '==', 'pending_verification'))
     orders_ref.on_snapshot(on_snapshot)
 
 # Iniciar la escucha en segundo plano
