@@ -12,7 +12,6 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 from google.cloud.firestore_v1.base_query import FieldFilter
 from dotenv import load_dotenv
-from zoneinfo import ZoneInfo
 
 load_dotenv()
 
@@ -65,28 +64,35 @@ if not all([TESORO_SUCURSAL, TESORO_CAJA, TESORO_PASS]):
     raise ValueError("Faltan variables de entorno del Banco del Tesoro (TESORO_SUCURSAL, TESORO_CAJA, TESORO_PASS).")
 
 # =========================================================
-# FUNCIONES AUXILIARES
+# FUNCIONES AUXILIARES DE FORMATEO (MUY IMPORTANTE)
 # =========================================================
-def parse_monto_safe(monto_val):
+def formato_monto_formulario(monto_val):
+    """Convierte cualquier monto al formato estricto que exige el formulario del banco (ej. '115,51')"""
     try:
-        if isinstance(monto_val, (int, float)):
-            return float(monto_val)
-        m_str = str(monto_val).strip()
-        if ',' in m_str:
-            m_str = m_str.replace('.', '').replace(',', '.')
-        return float(m_str)
+        if isinstance(monto_val, str):
+            m_str = monto_val.strip()
+            if ',' in m_str and '.' in m_str: # Ejemplo: 1.000,50
+                m_str = m_str.replace('.', '').replace(',', '.')
+            elif ',' in m_str:
+                m_str = m_str.replace(',', '.')
+            f_val = float(m_str)
+        else:
+            f_val = float(monto_val)
+        
+        # Devuelve string con 2 decimales y coma
+        return f"{f_val:.2f}".replace('.', ',')
     except Exception:
-        return -1.0
+        return "0,00"
 
 def solo_numeros(cadena):
     return re.sub(r'\D', '', str(cadena or ''))
 
 # =========================================================
-# 4. LÓGICA DEL BOT BANCARIO
+# 4. LÓGICA DEL BOT BANCARIO (ESTRATEGIA ZERO TRUST)
 # =========================================================
 def procesar_validacion_en_banco(order_id, datos_orden):
     print("\n" + "="*80)
-    print(f"🚀 [INICIO DE PROCESAMIENTO] Orden ID: {order_id}")
+    print(f"🚀 [INICIO DE PROCESAMIENTO ZERO TRUST] Orden ID: {order_id}")
     print("="*80)
 
     session = requests.Session()
@@ -100,37 +106,37 @@ def procesar_validacion_en_banco(order_id, datos_orden):
     })
     
     api_token_global = None
-    resultado_final = {"status": "ERROR", "mensaje": "Fallo desconocido durante la ejecución del bot."}
+    resultado_final = {"status": "ERROR", "mensaje": "Fallo desconocido."}
 
     try:
         # --- PASO 0: EXTRAER DATOS FIRESTORE ---
         payment_details = datos_orden.get('payment_details', {})
-        print(f"[FIRESTORE payment_details]: {json.dumps(payment_details, ensure_ascii=False)}")
         
         referencia_raw = payment_details.get('referencia') or payment_details.get('reference') or ''
         banco_orden = str(payment_details.get('banco', '')).strip()
         telefono_orden = str(payment_details.get('telefono', '')).strip()
         monto_orden_raw = payment_details.get('monto_bot', '')
         
-        referencia_6_digitos = str(referencia_raw).strip().zfill(6)[-6:]
-        monto_orden_float = parse_monto_safe(monto_orden_raw)
-        tel_orden_num = solo_numeros(telefono_orden)
-        banco_orden_num = solo_numeros(banco_orden)
+        # Preparar para el formulario
+        ref_6_digitos = str(referencia_raw).strip().zfill(6)[-6:]
+        monto_form = formato_monto_formulario(monto_orden_raw)
+        tel_form = solo_numeros(telefono_orden)
+        banco_form = solo_numeros(banco_orden)
 
-        print("\n[DATOS DE LA ORDEN]:")
-        print(f"  • Ref (6 dígitos): '{referencia_6_digitos}'")
-        print(f"  • Monto: {monto_orden_float} VES")
-        print(f"  • Teléfono: '{tel_orden_num}'")
-        print(f"  • Banco: '{banco_orden_num}'")
+        print("\n[DATOS PREPARADOS PARA FORMULARIO DEL BANCO]:")
+        print(f"  • Ref (6 dígitos): '{ref_6_digitos}'")
+        print(f"  • Monto: '{monto_form}'")
+        print(f"  • Teléfono: '{tel_form}'")
+        print(f"  • Banco: '{banco_form}'")
 
-        if not referencia_6_digitos or monto_orden_float <= 0:
-            raise Exception("La orden carece de referencia o el monto es inválido en 'payment_details'.")
+        if not ref_6_digitos or monto_form == "0,00":
+            raise Exception("Datos insuficientes en la orden (Falta referencia o monto).")
 
         session.cookies.clear()
         
         # --- PASO 1: LOGIN ---
-        print("\n[PASO 1] Solicitando formulario de login...")
-        res_get = session.get('https://tesoropagos.bt.com.ve/login', timeout=12)
+        print("\n[PASO 1] Entrando a Login...")
+        res_get = session.get('https://tesoropagos.bt.com.ve/login', timeout=15)
         soup = BeautifulSoup(res_get.text, 'html.parser')
         
         payload_login = {}
@@ -142,108 +148,70 @@ def procesar_validacion_en_banco(order_id, datos_orden):
         payload_login['box_number'] = TESORO_CAJA
         payload_login['password'] = TESORO_PASS
         
+        if '_token' not in payload_login:
+            raise Exception("Fallo obteniendo token CSRF inicial.")
+
         time.sleep(1)
         
-        print("[PASO 1] Enviando credenciales...")
+        print("[PASO 1] Iniciando sesión...")
         session.headers.update({'Referer': 'https://tesoropagos.bt.com.ve/login'})
-        res_login = session.post('https://tesoropagos.bt.com.ve/login', data=payload_login, allow_redirects=False, timeout=12)
+        res_login = session.post('https://tesoropagos.bt.com.ve/login', data=payload_login, allow_redirects=False, timeout=15)
         
         location = res_login.headers.get('Location', '')
         if res_login.status_code != 302 or 'login' in location:
             raise Exception("Credenciales del banco rechazadas o sesión bloqueada.")
             
-        print("[PASO 1] Login exitoso.")
+        print("  ✅ Login exitoso.")
         
-        # --- PASO 2: TOKEN API ---
-        print("\n[PASO 2] Obteniendo token CSRF...")
-        res_dash = session.get('https://tesoropagos.bt.com.ve/pago-movil', timeout=12)
+        # --- PASO 2: OBTENER TOKEN DE VALIDACIÓN ---
+        print("\n[PASO 2] Extrayendo CSRF de Pago Móvil...")
+        res_dash = session.get('https://tesoropagos.bt.com.ve/pago-movil', timeout=15)
         soup_dash = BeautifulSoup(res_dash.text, 'html.parser')
         meta_token = soup_dash.find('meta', {'name': 'csrf-token'})
         api_token = meta_token['content'] if meta_token else payload_login.get('_token')
         api_token_global = api_token
 
-        # --- PASO 3: CONSULTAR MOVIMIENTOS ---
-        print("\n[PASO 3] Consultando movimientos en la API...")
-        tz_ve = ZoneInfo("America/Caracas")
-        hoy = datetime.now(tz_ve).strftime("%d/%m/%Y")
-        
-        payload_api = {"fechaDesde": hoy, "fechaHasta": hoy}
+        # --- PASO 3: ENVIAR FORMULARIO DE VALIDACIÓN ---
+        print("\n[PASO 3] Enviando datos al motor de verificación del banco...")
+        payload_validacion = {
+            '_token': api_token,
+            'monto': monto_form,
+            'banco': banco_form,
+            'telefono': tel_form,
+            'referencia': ref_6_digitos
+        }
         
         session.headers.update({
-            'Accept': 'application/json, text/plain, */*',
-            'Content-Type': 'application/json',
-            'X-CSRF-TOKEN': api_token,
-            'X-Requested-With': 'XMLHttpRequest',
-            'Referer': 'https://tesoropagos.bt.com.ve/pago-movil'
+            'Referer': 'https://tesoropagos.bt.com.ve/pago-movil',
+            'Content-Type': 'application/x-www-form-urlencoded'
         })
         
-        res_api = session.post('https://tesoropagos.bt.com.ve/pago-movil/movimientos', json=payload_api, timeout=12)
+        res_val = session.post('https://tesoropagos.bt.com.ve/pago-movil', data=payload_validacion, allow_redirects=True, timeout=15)
+        html_respuesta = res_val.text.lower()
         
-        if res_api.status_code != 200:
-            raise Exception(f"La API bancaria respondió con HTTP {res_api.status_code}.")
-             
-        movimientos_json = res_api.json()
+        # --- PASO 4: INTERPRETACIÓN (ZERO TRUST) ---
+        print("\n[PASO 4] Analizando dictamen del banco...")
         
-        print("\n" + "-"*60)
-        print(" [RESPUESTA RAW DE LA API DEL BANCO]")
-        print(json.dumps(movimientos_json, indent=2, ensure_ascii=False))
-        print("-"*60 + "\n")
-        
-        # --- PASO 4: VERIFICACIÓN INTELIGENTE ---
-        print("[PASO 4] Analizando movimientos del día...")
-        pago_encontrado = None
-        
-        lista_movs = movimientos_json if isinstance(movimientos_json, list) else movimientos_json.get('data', []) if isinstance(movimientos_json, dict) else []
-        
-        for idx, mov in enumerate(lista_movs, 1):
-            if not isinstance(mov, dict):
-                continue
-
-            # 1. Extraer Referencia
-            ref_banco_raw = str(
-                mov.get('referencia') or 
-                mov.get('numReferencia') or 
-                mov.get('nroReferencia') or 
-                mov.get('secuencia') or ''
-            ).strip()
-            ref_banco_6 = ref_banco_raw.zfill(6)[-6:] if ref_banco_raw else ''
-
-            # 2. Extraer Monto
-            monto_banco_raw = mov.get('monto') or mov.get('montoTransaccion') or mov.get('monto_transaccion') or '0'
-            monto_banco_float = parse_monto_safe(monto_banco_raw)
-
-            # 3. Extraer Teléfono (si viene)
-            tel_banco_raw = str(mov.get('telefono') or mov.get('telefonoOrigen') or mov.get('celular') or mov.get('origen') or '').strip()
-            tel_banco_num = solo_numeros(tel_banco_raw)
-
-            # 4. Extraer Banco (si viene)
-            banco_api_raw = str(mov.get('banco') or mov.get('bancoOrigen') or mov.get('codBanco') or mov.get('codigoBanco') or '').strip()
-            banco_api_num = solo_numeros(banco_api_raw)
-
-            # --- REGLAS DE VALIDACIÓN ---
-            # Referencia y Monto son OBLIGATORIOS
-            match_ref = (ref_banco_6 == referencia_6_digitos)
-            match_monto = abs(monto_orden_float - monto_banco_float) < 0.1
-
-            # Teléfono y Banco se validan SOLO SI el banco los incluye en su respuesta
-            match_tel = (tel_orden_num[-7:] == tel_banco_num[-7:]) if (tel_orden_num and tel_banco_num) else True
-            match_banco = (banco_orden_num[-3:] in banco_api_num) if (banco_orden_num and banco_api_num) else True
-
-            print(f"\n--- Evaluando Movimiento #{idx} ---")
-            print(f"  • REF  -> Banco: '{ref_banco_6}' vs Orden: '{referencia_6_digitos}' -> {'✅ OK' if match_ref else '❌ DIFERENTE'}")
-            print(f"  • MONTO-> Banco: {monto_banco_float} vs Orden: {monto_orden_float} -> {'✅ OK' if match_monto else '❌ DIFERENTE'}")
-            print(f"  • TEL  -> Banco: '{tel_banco_num}' vs Orden: '{tel_orden_num}' -> {'✅ OK' if match_tel else '⚠️ OMITIDO/DIFERENTE'}")
-            print(f"  • BANCO-> Banco: '{banco_api_num}' vs Orden: '{banco_orden_num}' -> {'✅ OK' if match_banco else '⚠️ OMITIDO/DIFERENTE'}")
-
-            if match_ref and match_monto and match_tel and match_banco:
-                pago_encontrado = mov
-                print(f"🎉 ¡PAGO VERIFICADO EXITOSAMENTE EN MOVIMIENTO #{idx}!")
-                break
-
-        if pago_encontrado:
-            resultado_final = {"status": "APROBADO", "mensaje": "Pago verificado exitosamente en el Banco del Tesoro."}
+        if any(w in html_respuesta for w in ["exitoso", "aprobado", "verificado"]):
+            resultado_final = {"status": "APROBADO", "mensaje": "Pago validado y consumido exitosamente por el banco."}
+            print("  🎉 DICTAMEN: Aprobado.")
+            
+        elif any(w in html_respuesta for w in ["ya utilizad", "ya procesad", "repetid", "ya ha sido procesada"]):
+            resultado_final = {"status": "YA_UTILIZADO", "mensaje": "Fraude prevenido: Esta referencia ya fue cobrada y validada anteriormente."}
+            print("  🚨 DICTAMEN: Rechazado (Referencia repetida / ya procesada).")
+            
+        elif any(w in html_respuesta for w in ["no encontrad", "inválid", "rechazad", "no coincide"]):
+            resultado_final = {"status": "NO_ENCONTRADO", "mensaje": "El banco no encontró ningún pago que coincida con estos datos exactos."}
+            print("  🚫 DICTAMEN: Rechazado (No encontrado o datos inválidos).")
+            
         else:
-            resultado_final = {"status": "NO_ENCONTRADO", "mensaje": "La referencia no figura en los movimientos de hoy o el monto no coincide."}
+            # Si el banco devuelve algo distinto, extraemos el texto limpio del HTML para verlo en los logs de Render
+            soup_res = BeautifulSoup(res_val.text, 'html.parser')
+            texto_limpio = soup_res.get_text(separator=' | ', strip=True)
+            print("\n  ⚠️ [ALERTA] Respuesta desconocida del banco. Texto extraído del HTML:")
+            print(f"  {texto_limpio[:500]}...") # Imprime los primeros 500 caracteres
+            
+            resultado_final = {"status": "DESCONOCIDO", "mensaje": "Respuesta no estándar del banco. Revisa los logs de Render."}
              
     except Exception as e:
         print(f"\n❌ [BOT EXCEPCIÓN] Error procesando la orden: {e}")
@@ -253,7 +221,7 @@ def procesar_validacion_en_banco(order_id, datos_orden):
         # --- PASO 5: LOGOUT ---
         if api_token_global:
             try:
-                print("\n[PASO 5] Cerrando sesión bancaria...")
+                print("\n[PASO 5] Cerrando sesión bancaria de forma segura...")
                 session.headers.update({'Accept': 'text/html', 'Content-Type': 'application/x-www-form-urlencoded', 'X-Requested-With': None})
                 session.post('https://tesoropagos.bt.com.ve/logout', data={'_token': api_token_global}, allow_redirects=False, timeout=5)
             except Exception as e:
@@ -271,18 +239,18 @@ def procesar_validacion_en_banco(order_id, datos_orden):
             })
             print(f"\n✅ [FIRESTORE] Orden {order_id} actualizada a 'approved'.")
             
-        elif resultado_final['status'] == 'NO_ENCONTRADO':
+        elif resultado_final['status'] in ['YA_UTILIZADO', 'NO_ENCONTRADO']:
             order_ref.update({
                 'status': 'rejected',
                 'bot_verification_msg': resultado_final['mensaje']
             })
-            print(f"\n🚫 [FIRESTORE] Orden {order_id} actualizada a 'rejected'.")
+            print(f"\n🛡️ [FIRESTORE] Orden {order_id} rechazada por seguridad ({resultado_final['status']}).")
             
         else:
             order_ref.update({
-                'bot_verification_msg': f"Error en verificación: {resultado_final['mensaje']}"
+                'bot_verification_msg': f"Error/Revisión Manual: {resultado_final['mensaje']}"
             })
-            print(f"\n⚠️ [FIRESTORE] Registrado mensaje de error en orden {order_id}.")
+            print(f"\n⚠️ [FIRESTORE] Mensaje técnico guardado. Requiere revisión manual para la orden {order_id}.")
             
     except Exception as e:
         print(f"❌ [FIRESTORE ERROR] Falló la actualización de la orden {order_id}: {e}")
@@ -297,7 +265,7 @@ def on_snapshot(col_snapshot, changes, read_time):
         if change.type.name == 'ADDED':
             order_id = change.document.id
             order_data = change.document.to_dict()
-            print(f"⚡ [FIRESTORE EVENT] Nueva orden detectada: {order_id}")
+            print(f"⚡ [FIRESTORE EVENT] Nueva orden pendiente detectada: {order_id}")
             
             threading.Thread(
                 target=procesar_validacion_en_banco, 
