@@ -189,71 +189,74 @@ def procesar_validacion_en_banco(order_id, datos_orden):
         
         res_val = session.post('https://tesoropagos.bt.com.ve/pago-movil', data=payload_validacion, allow_redirects=True, timeout=15)
         
-        # --- PASO 4: INTERPRETACIÓN ESTRICTA ZERO TRUST ---
+        # --- PASO 4: INTERPRETACIÓN ESTRICTA (ZERO TRUST) ---
         logger.info("[PASO 4] Analizando dictamen del banco...")
         
         dictamen = "NO_ENCONTRADO"
         mensaje_banco = "El banco no encontró ningún pago que coincida con estos datos exactos."
 
-        # INTENTO 1: EVALUACIÓN SI EL BANCO DEVOLVIÓ JSON
         try:
+            # CASO A: RESPUESTA EN FORMATO JSON
             data_json = res_val.json()
             logger.info(f"  [RESPUESTA JSON]: {json.dumps(data_json, ensure_ascii=False)}")
             
-            # Evaluamos tipos booleanos reales y claves de estado
             is_success = data_json.get('success') in [True, 'true', 1, '1'] or data_json.get('status') in ['success', 'ok', 'approved']
             msg_json = str(data_json.get('message') or data_json.get('msg') or data_json.get('error') or data_json.get('leyenda') or '').lower()
 
-            # 1. Evaluar si es una referencia duplicada/ya usada
             if any(w in msg_json for w in ["confirmado", "ya fue confirmad", "ya utilizad", "ya procesad", "repetid"]):
                 dictamen = "YA_UTILIZADO"
                 mensaje_banco = f"Fraude prevenido: {msg_json if msg_json else 'Esta referencia ya fue confirmada previamente.'}"
 
-            # 2. PRIORIDAD AL RECHAZO: Si no es success O contiene palabras de error/no encontrado
             elif not is_success or any(w in msg_json for w in ["no encontrad", "inválid", "rechazad", "no coincide", "no existe", "error", "fallo"]):
                 dictamen = "NO_ENCONTRADO"
                 mensaje_banco = f"El banco rechazó la validación: {msg_json if msg_json else 'Datos de pago incorrectos o inexistentes.'}"
 
-            # 3. Evaluar aprobación explícita
             elif is_success or any(w in msg_json for w in ["exitoso", "aprobado", "verificado"]):
                 dictamen = "APROBADO"
                 mensaje_banco = "Pago validado y consumido exitosamente por el banco."
 
-        # INTENTO 2: EVALUACIÓN SI EL BANCO DEVOLVIÓ HTML
         except Exception:
+            # CASO B: RESPUESTA EN FORMATO HTML
             soup_res = BeautifulSoup(res_val.text, 'html.parser')
-            alertas = soup_res.find_all(class_=re.compile(r'alert|toast|swal|invalid-feedback|message|response', re.I))
             
+            # Limpieza profunda: Eliminar scripts, CSS y tags no visibles que ensucian con 'true'/'success'
+            for element in soup_res(["script", "style", "head", "title", "meta"]):
+                element.extract()
+            
+            # Buscar texto dentro de avisos o alertas
+            alertas = soup_res.find_all(class_=re.compile(r'alert|toast|swal|invalid-feedback|message|response|notification', re.I))
             if alertas:
-                texto_analizar = " ".join([a.get_text(strip=True) for a in alertas]).lower()
+                texto_visible = " ".join([a.get_text(strip=True) for a in alertas]).lower()
             else:
-                for script in soup_res(["script", "style"]):
-                    script.extract()
-                texto_analizar = soup_res.get_text(separator=' ', strip=True).lower()
+                texto_visible = soup_res.get_text(separator=' ', strip=True).lower()
 
-            logger.info(f"  [TEXTO EXTRAÍDO DE HTML]: '{texto_analizar[:200]}...'")
+            logger.info(f"  [TEXTO VISIBLE HTML EXTRAÍDO]: '{texto_visible[:250]}...'")
 
-            # 1. Referencia ya usada
-            if any(w in texto_analizar for w in ["confirmado", "ya fue confirmad", "ya utilizad", "ya procesad", "repetid"]):
+            # 1. Evaluar si la referencia ya fue utilizada
+            if any(w in texto_visible for w in ["confirmado", "ya fue confirmad", "ya utilizad", "ya procesad", "repetid"]):
                 dictamen = "YA_UTILIZADO"
-                mensaje_banco = "Fraude prevenido: Esta referencia ya fue confirmada anteriormente."
+                mensaje_banco = "Fraude prevenido: Esta referencia ya fue confirmada o procesada anteriormente."
 
-            # 2. Prioridad a errores / pago no encontrado
-            elif any(w in texto_analizar for w in ["no encontrad", "inválid", "rechazad", "no coincide", "no coinciden", "no existe", "incorrecto", "error"]):
-                dictamen = "NO_ENCONTRADO"
-                mensaje_banco = "El banco no encontró un pago coincidente."
-
-            # 3. Frases compuestas estrictas para aprobación en HTML (sin palabras sueltas como 'true' o 'success')
-            elif any(w in texto_analizar for w in ["pago exitoso", "pago verificado", "operacion exitosa", "pago procesado con exito"]):
+            # 2. Exigir frases explícitas de éxito (NUNCA palabras sueltas como 'true' o 'success')
+            elif any(phrase in texto_visible for phrase in [
+                "pago exitoso", 
+                "pago verificado", 
+                "se validó el pago de forma exitosa", 
+                "se valido el pago de forma exitosa",
+                "operacion exitosa", 
+                "operación exitosa",
+                "pago procesado con exito",
+                "pago procesado con éxito"
+            ]):
                 dictamen = "APROBADO"
                 mensaje_banco = "Pago validado y consumido exitosamente por el banco."
 
-            # 4. Respaldo Zero Trust
+            # 3. Respaldo Zero Trust: Si no contiene la frase completa de éxito, SE RECHAZA
             else:
                 dictamen = "NO_ENCONTRADO"
-                mensaje_banco = "El banco no confirmó el pago de forma clara."
+                mensaje_banco = "El banco no confirmó el pago (datos inválidos, no coincidentes o inexistentes)."
 
-        # ASIGNACIÓN FINAL DE DICCIONARIO
+        # ASIGNACIÓN FINAL
         if dictamen == "APROBADO":
             resultado_final = {"status": "APROBADO", "mensaje": mensaje_banco}
             logger.info("  🎉 DICTAMEN: Aprobado.")
