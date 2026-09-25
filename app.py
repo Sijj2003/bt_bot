@@ -82,11 +82,28 @@ def procesar_validacion_en_banco(order_id, datos_orden):
     resultado_final = {"status": "ERROR", "mensaje": "Fallo desconocido durante la ejecución del bot."}
 
     try:
-        referencia_raw = datos_orden.get('referencia') or datos_orden.get('reference') or ''
-        # Obtener los últimos 6 dígitos limpios
-        referencia_6_digitos = str(referencia_raw).strip().zfill(6)[-6:]
+        # --- NUEVA EXTRACCIÓN SEGURA DESDE PAYMENT_DETAILS ---
+        payment_details = datos_orden.get('payment_details', {})
         
-        print(f"[BOT] Procesando orden {order_id}. Buscando últimos 6 dígitos: '{referencia_6_digitos}'...")
+        referencia_raw = payment_details.get('referencia') or payment_details.get('reference') or ''
+        banco_orden = str(payment_details.get('banco', '')).strip()
+        telefono_orden = str(payment_details.get('telefono', '')).strip()
+        monto_orden_str = str(payment_details.get('monto_bot', '')).strip()
+        
+        if not referencia_raw or not banco_orden or not monto_orden_str:
+             raise Exception("La orden no contiene todos los datos de pago requeridos (referencia, banco, monto).")
+
+        # Limpieza y preparación de variables de la orden
+        referencia_6_digitos = str(referencia_raw).strip().zfill(6)[-6:]
+        try:
+            # Convierte "115,51" a 115.51
+            monto_orden_float = float(monto_orden_str.replace('.', '').replace(',', '.'))
+        except ValueError:
+            monto_orden_float = 0.0
+
+        print(f"[BOT] Procesando orden {order_id}...")
+        print(f"[BOT] Esperado -> Ref: {referencia_6_digitos} | Monto: {monto_orden_float} | Tlf: {telefono_orden} | Banco: {banco_orden}")
+        
         session.cookies.clear()
         
         # --- PASO 1: LOGIN ---
@@ -122,7 +139,7 @@ def procesar_validacion_en_banco(order_id, datos_orden):
         api_token = meta_token['content'] if meta_token else payload_login.get('_token')
         api_token_global = api_token
         
-        # --- PASO 3: CONSULTAR API DE MOVIMIENTOS (ZONA HORARIA CARACAS) ---
+        # --- PASO 3: CONSULTAR API DE MOVIMIENTOS ---
         print("[BOT] Consultando movimientos en el banco...")
         tz_ve = ZoneInfo("America/Caracas")
         hoy = datetime.now(tz_ve).strftime("%d/%m/%Y")
@@ -146,9 +163,8 @@ def procesar_validacion_en_banco(order_id, datos_orden):
              raise Exception(f"La API del banco devolvió error HTTP {res_api.status_code}.")
              
         movimientos = res_api.json()
-        print(f"[BOT DEBUG] Respuesta raw del banco: {json.dumps(movimientos, ensure_ascii=False)}")
         
-        # --- PASO 4: BUSCAR REFERENCIA ---
+        # --- PASO 4: BUSCAR Y VALIDAR ESTRICTAMENTE ---
         print("[BOT] Analizando movimientos del día...")
         pago_encontrado = None
         
@@ -156,7 +172,6 @@ def procesar_validacion_en_banco(order_id, datos_orden):
         
         for mov in lista_movs:
             if isinstance(mov, dict):
-                # Extraer referencia probando diferentes nombres de campos posibles
                 ref_banco_raw = str(
                     mov.get('referencia') or 
                     mov.get('numReferencia') or 
@@ -165,20 +180,47 @@ def procesar_validacion_en_banco(order_id, datos_orden):
                 ).strip()
                 
                 if ref_banco_raw:
-                    # Extraer únicamente los últimos 6 dígitos de la referencia recibida del banco
                     ref_banco_6 = ref_banco_raw.zfill(6)[-6:]
-                    print(f"[BOT DEBUG] Comparando -> Banco: '{ref_banco_raw}' (últimos 6: '{ref_banco_6}') vs Orden: '{referencia_6_digitos}'")
                     
                     if ref_banco_6 == referencia_6_digitos:
-                        pago_encontrado = mov
-                        break
+                        # --- INICIO DE VALIDACIÓN ESTRICTA (MONTO, TLF Y BANCO) ---
+                        
+                        # Nota: Verifica que estas claves ('monto', 'telefono', 'banco') 
+                        # coincidan con lo que arroja la respuesta JSON del banco.
+                        monto_banco_str = str(mov.get('monto') or mov.get('montoTransaccion') or '0').strip()
+                        tel_banco = str(mov.get('telefono') or mov.get('telefonoOrigen') or mov.get('celular') or '').strip()
+                        banco_origen_api = str(mov.get('banco') or mov.get('bancoOrigen') or mov.get('codBanco') or '').strip()
+                        
+                        try:
+                            monto_banco_float = float(monto_banco_str.replace('.', '').replace(',', '.'))
+                        except ValueError:
+                            monto_banco_float = -1.0
+                            
+                        # Comparaciones seguras:
+                        # 1. Monto: Margen de 0.1 por si el banco envía redondeos.
+                        monto_coincide = abs(monto_orden_float - monto_banco_float) < 0.1 
+                        
+                        # 2. Teléfono: Comparamos los últimos 7 dígitos para evadir prefijos (0424 vs +58424 vs 424)
+                        telefono_coincide = (telefono_orden[-7:] == tel_banco[-7:]) if telefono_orden and tel_banco else False
+                        
+                        # 3. Banco: Comparamos los últimos 3 o 4 dígitos (0102 vs 102 vs 0102 Banco)
+                        banco_coincide = (banco_orden[-3:] in banco_origen_api) if banco_orden else False
+                        
+                        if monto_coincide and telefono_coincide and banco_coincide:
+                            pago_encontrado = mov
+                            break
+                        else:
+                            print(f"[BOT DEBUG] Peligro evitado: Referencia {ref_banco_6} coincide pero falló la seguridad estricta:")
+                            print(f"  -> Monto - Esperado: {monto_orden_float} | Banco: {monto_banco_float} (Valido: {monto_coincide})")
+                            print(f"  -> Tlf   - Esperado: {telefono_orden} | Banco: {tel_banco} (Valido: {telefono_coincide})")
+                            print(f"  -> Banco - Esperado: {banco_orden} | Banco: {banco_origen_api} (Valido: {banco_coincide})")
         
         if pago_encontrado:
-             resultado_final = {"status": "APROBADO", "mensaje": "Pago verificado exitosamente en los movimientos de hoy."}
-             print(f"[BOT] ¡Referencia {referencia_6_digitos} encontrada para orden {order_id}!")
+             resultado_final = {"status": "APROBADO", "mensaje": "Pago verificado exitosamente (Ref, Monto, Tlf y Banco coinciden)."}
+             print(f"[BOT] ¡Aprobación estricta completada para orden {order_id}!")
         else:
-             resultado_final = {"status": "NO_ENCONTRADO", "mensaje": "La referencia no figura en los movimientos bancarios de hoy."}
-             print(f"[BOT] Referencia {referencia_6_digitos} NO encontrada.")
+             resultado_final = {"status": "NO_ENCONTRADO", "mensaje": "La transacción no figura en el banco o los datos de seguridad (Monto/Tlf/Banco) no coinciden."}
+             print(f"[BOT] Transacción rechazada para {order_id}.")
              
     except Exception as e:
         print(f"[BOT ERROR] {e}")
