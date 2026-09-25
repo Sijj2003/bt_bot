@@ -6,26 +6,29 @@ import os
 import time
 from datetime import datetime
 
+# Importamos dotenv para leer el archivo .env si estamos en local
+from dotenv import load_dotenv
+load_dotenv()
+
 app = Flask(__name__)
 
 # =========================================================
-# CONFIGURACIÓN (Variables de entorno de Render)
+# CONFIGURACIÓN ESTRICTA (Sin hardcoding)
 # =========================================================
-# Reemplaza la URL de abajo con la URL de tu backend en PythonAnywhere si es diferente
-API_BACKEND_URL = os.environ.get("API_BACKEND_URL", "https://sijj2003.pythonanywhere.com")
-BOT_SECRET_KEY = os.environ.get("BOT_SECRET", "Gymenez2026Secure")
-TESORO_SUCURSAL = os.environ.get("TESORO_SUCURSAL", "01334301")
-TESORO_CAJA = os.environ.get("TESORO_CAJA", "03")
-TESORO_PASS = os.environ.get("TESORO_PASS", "31103356")
+API_BACKEND_URL = os.environ.get("API_BACKEND_URL")
+BOT_SECRET_KEY = os.environ.get("BOT_SECRET")
+TESORO_SUCURSAL = os.environ.get("TESORO_SUCURSAL")
+TESORO_CAJA = os.environ.get("TESORO_CAJA")
+TESORO_PASS = os.environ.get("TESORO_PASS")
+
+# Validación temprana: Si falta alguna credencial, el servidor no arranca.
+if not all([API_BACKEND_URL, BOT_SECRET_KEY, TESORO_SUCURSAL, TESORO_CAJA, TESORO_PASS]):
+    raise ValueError("Faltan variables de entorno críticas. Revisa tu archivo .env o la configuración en Render.")
 
 # =========================================================
 # LÓGICA DEL BOT BANCARIO
 # =========================================================
 def procesar_validacion_en_banco(datos_orden):
-    """
-    Se ejecuta en un hilo separado. 
-    Inicia sesión, verifica la referencia en la API del banco y envía el resultado a PythonAnywhere.
-    """
     session = requests.Session()
     session.headers.update({
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36',
@@ -57,7 +60,7 @@ def procesar_validacion_en_banco(datos_orden):
         payload_login['box_number'] = TESORO_CAJA
         payload_login['password'] = TESORO_PASS
         
-        time.sleep(1) # Breve pausa para no saturar al banco
+        time.sleep(1)
         
         print("[BOT] Enviando credenciales...")
         session.headers.update({'Referer': 'https://tesoropagos.bt.com.ve/login'})
@@ -102,10 +105,9 @@ def procesar_validacion_en_banco(datos_orden):
         
         # --- PASO 4: BUSCAR REFERENCIA ---
         print("[BOT] Analizando JSON de respuesta...")
-        referencia_a_buscar = str(datos_orden.get('referencia', ''))[-6:] # Aseguramos buscar últimos 6 dígitos
+        referencia_a_buscar = str(datos_orden.get('referencia', ''))[-6:]
         pago_encontrado = None
         
-        # Extraemos la lista de movimientos dependiendo de cómo la devuelva el banco
         lista_movs = movimientos if isinstance(movimientos, list) else movimientos.get('data', []) if isinstance(movimientos, dict) else []
         
         for mov in lista_movs:
@@ -117,7 +119,6 @@ def procesar_validacion_en_banco(datos_orden):
                     break
         
         if pago_encontrado:
-             # Opcional: Podrías verificar también el monto aquí si el JSON lo incluye.
              resultado_final = {"status": "APROBADO", "mensaje": "Pago verificado exitosamente en los movimientos de hoy."}
              print("[BOT] ¡Referencia Encontrada!")
         else:
@@ -149,18 +150,17 @@ def procesar_validacion_en_banco(datos_orden):
                 "mensaje": resultado_final['mensaje']
             },
             headers={"X-Bot-Secret": BOT_SECRET_KEY},
-            timeout=10 # Aquí sí podemos esperar a que PythonAnywhere conteste
+            timeout=10 
         )
         print("[BOT] Proceso finalizado.")
     except Exception as e:
         print(f"[BOT ERROR WEBHOOK] Falló el envío a PythonAnywhere: {e}")
 
 # ====================================================================
-# ENDPOINT WEBHOOK (Escucha las peticiones de PythonAnywhere)
+# ENDPOINT WEBHOOK
 # ====================================================================
 @app.route('/webhook/verificar', methods=['POST'])
 def recibir_orden():
-    # Seguridad: Solo tu backend puede llamar a este bot
     if request.headers.get("X-Bot-Secret") != BOT_SECRET_KEY:
         print("[WEBHOOK] Acceso denegado. Secreto incorrecto.")
         return jsonify({"error": "No autorizado"}), 401
@@ -172,13 +172,10 @@ def recibir_orden():
         
     print(f"[WEBHOOK] Recibida orden {datos_orden['id_pedido']} para verificar referencia {datos_orden.get('referencia')}")
     
-    # Lanzar hilo en segundo plano (No bloquea a PythonAnywhere)
     threading.Thread(target=procesar_validacion_en_banco, args=(datos_orden,)).start()
     
-    # Responder Inmediatamente
     return jsonify({"success": True, "mensaje": "Bot iniciado y trabajando en segundo plano"}), 200
 
-# Ruta de Salud (Para que Render sepa que el servidor está vivo)
 @app.route('/', methods=['GET'])
 def health_check():
     return "Gymenez Bot is Running!", 200
