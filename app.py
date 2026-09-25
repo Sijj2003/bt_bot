@@ -266,7 +266,55 @@ def procesar_validacion_en_banco(order_id, datos_orden):
         else:
             resultado_final = {"status": "NO_ENCONTRADO", "mensaje": mensaje_banco}
             logger.warning(f"  🚫 DICTAMEN: Rechazado ({mensaje_banco}).")
+
+    except Exception as e:
+        logger.error(f"❌ [BOT EXCEPCIÓN] Error procesando la orden: {e}")
+        resultado_final = {"status": "ERROR", "mensaje": str(e)}
+        
+    finally:
+        # --- PASO 5: LOGOUT SEGURO ---
+        if api_token_global:
+            try:
+                logger.info("[PASO 5] Cerrando sesión bancaria...")
+                session.headers.update({
+                    'Accept': 'text/html', 
+                    'Content-Type': 'application/x-www-form-urlencoded', 
+                    'X-Requested-With': 'XMLHttpRequest'
+                })
+                session.post('https://tesoropagos.bt.com.ve/logout', data={'_token': api_token_global}, allow_redirects=False, timeout=5)
+            except Exception as e:
+                logger.error(f"[PASO 5 ERROR] Error cerrando sesión: {e}")
+                
+    # --- PASO 6: ACTUALIZAR FIRESTORE ---
+    try:
+        order_ref = db.collection('store_orders').document(order_id)
+        
+        if resultado_final['status'] == 'APROBADO':
+            order_ref.update({
+                'status': 'approved',
+                'bot_verification_msg': resultado_final['mensaje'],
+                'verified_at': firestore.SERVER_TIMESTAMP
+            })
+            logger.info(f"✅ [FIRESTORE] Orden {order_id} actualizada a 'approved'.")
             
+        elif resultado_final['status'] in ['YA_UTILIZADO', 'NO_ENCONTRADO']:
+            order_ref.update({
+                'status': 'rejected',
+                'bot_verification_msg': resultado_final['mensaje']
+            })
+            logger.info(f"🛡️ [FIRESTORE] Orden {order_id} actualizada a 'rejected' ({resultado_final['status']}).")
+            
+        else:
+            order_ref.update({
+                'bot_verification_msg': f"Error/Revisión Manual: {resultado_final['mensaje']}"
+            })
+            logger.warning(f"⚠️ [FIRESTORE] Estado técnico guardado para revisión manual en la orden {order_id}.")
+            
+    except Exception as e:
+        logger.error(f"❌ [FIRESTORE ERROR] Falló la actualización de la orden {order_id}: {e}")
+
+    print("="*80 + "\n")
+
 # =========================================================
 # 5. LISTENER EN TIEMPO REAL (FIRESTORE)
 # =========================================================
