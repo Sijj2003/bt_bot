@@ -102,6 +102,46 @@ def binance_worker_loop(worker_id):
             binance_queue.task_done()
 
 # =========================================================
+# 🧹 BARREDOR ANTI-LIMBO (PÉGALO EXACTAMENTE AQUÍ)
+# =========================================================
+from datetime import datetime, timezone
+
+def recuperador_ordenes_pendientes():
+    """Barredor Anti-Limbo que NO requiere índice compuesto de Firebase"""
+    logger.info("🧹 [SWEEPER] Hilo recuperador iniciado (Anti-Limbo).")
+    while True:
+        try:
+            time.sleep(60) 
+            ahora_ts = datetime.now(timezone.utc).timestamp()
+            
+            # Buscamos solo por estado para evitar errores de índices de Firebase
+            ordenes = db.collection('store_orders').where('status', '==', 'pending_retry').get()
+
+            for doc in ordenes:
+                order_id = doc.id
+                datos_orden = doc.to_dict()
+                
+                proximo = datos_orden.get('proximo_reintento')
+                if proximo:
+                    # Comparamos las fechas internamente en Python
+                    proximo_ts = proximo.timestamp()
+                    
+                    if proximo_ts <= ahora_ts:
+                        payment_method = datos_orden.get('paymentMethod') or datos_orden.get('payment_method') or datos_orden.get('payment_details', {}).get('payment_method', '')
+                        
+                        with lock_in_flight:
+                            if order_id not in processed_in_flight:
+                                processed_in_flight.add(order_id)
+                                logger.info(f"🔄 [SWEEPER] Rescatando orden del limbo: {order_id}")
+                                
+                                if payment_method == 'pago_movil':
+                                    pm_queue.put((order_id, datos_orden))
+                                elif payment_method == 'binance':
+                                    binance_queue.put((order_id, datos_orden))
+        except Exception as e:
+            logger.error(f"❌ [SWEEPER ERROR] Fallo: {e}")
+
+# =========================================================
 # 4. LISTENER EN TIEMPO REAL (FIRESTORE)
 # =========================================================
 def on_snapshot(col_snapshot, changes, read_time):
@@ -137,6 +177,9 @@ def start_bot_services():
     for i in range(3):
         threading.Thread(target=binance_worker_loop, args=(i+1,), daemon=True).start()
 
+    # 🧹 EL NUEVO BARREDOR PARA EVITAR EL LIMBO (Universal: Pago Móvil y Binance)
+    threading.Thread(target=recuperador_ordenes_pendientes, daemon=True).start()
+
     try:
         logger.info("🚀 [BOT] Iniciando Listener de Firestore para 'store_orders'...")
         orders_ref = db.collection('store_orders').where('status', '==', 'pending_verification')
@@ -145,6 +188,7 @@ def start_bot_services():
     except Exception as e:
         logger.error(f"❌ [BOT ERROR] Falló al iniciar el Listener de Firestore: {e}")
 
+# Iniciar servicios al cargar el script
 start_bot_services()
 
 if __name__ == '__main__':
