@@ -4,4 +4,3 @@ beautifulsoup4==4.12.3
 firebase-admin==6.4.0
 gunicorn==21.2.0
 python-dotenv
-firebase-admin
