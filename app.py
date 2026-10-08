@@ -1,163 +1,152 @@
 import os
-import time
-import threading
-import queue
-import logging
 import json
-from datetime import datetime, timezone
+import time
+import base64
+import queue
+import threading
+import logging
+from flask import Flask
 import firebase_admin
 from firebase_admin import credentials, firestore
-from flask import Flask
+from dotenv import load_dotenv
 
-# --- IMPORTAMOS LOS MÓDULOS AISLADOS ---
+# --- IMPORTACIÓN DE MÓDULOS ---
 import pago_movil_bot
-import binance_bot 
+import binance_bot
 
-# --- APLICACIÓN WEB PARA RENDER ---
-app = Flask(__name__)
+load_dotenv()
 
-@app.route('/')
-def health_check():
-    return "✅ Bot Orquestador operativo y escuchando a Firestore.", 200
-
-# --- CONFIGURACIÓN Y LOGS ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- INICIALIZACIÓN DE FIREBASE ---
-try:
-    firebase_creds_str = os.environ.get("FIREBASE_CREDENTIALS")
-    if not firebase_creds_str:
-        raise ValueError("La variable de entorno FIREBASE_CREDENTIALS está vacía.")
-        
-    cred_dict = json.loads(firebase_creds_str)
-    cred = credentials.Certificate(cred_dict) 
-    firebase_admin.initialize_app(cred)
-    db = firestore.client()
-    logger.info("✅ Firebase inicializado correctamente.")
-except Exception as e:
-    logger.error(f"❌ Error al inicializar Firebase: {e}")
+# =========================================================
+# 1. SERVIDOR FLASK (Health Check para Render)
+# =========================================================
+app = Flask(__name__)
 
-# --- VARIABLES GLOBALES Y CONTROL DE CONCURRENCIA ---
-pm_queue = queue.Queue()       
-binance_queue = queue.Queue()  
+@app.route('/', methods=['GET'])
+def health_check():
+    return "Gymenez Bot Worker is Active and Listening!", 200
 
-lock_in_flight = threading.Lock()
+# =========================================================
+# 2. INICIALIZACIÓN DE FIREBASE ADMIN (Tu lógica base64)
+# =========================================================
+firebase_credentials_raw = os.environ.get('FIREBASE_CREDENTIALS')
+
+if firebase_credentials_raw:
+    try:
+        if not firebase_credentials_raw.strip().startswith('{'):
+            decoded_bytes = base64.b64decode(firebase_credentials_raw)
+            cred_dict = json.loads(decoded_bytes.decode('utf-8'))
+        else:
+            cred_dict = json.loads(firebase_credentials_raw)
+            
+        cred = credentials.Certificate(cred_dict)
+        firebase_admin.initialize_app(cred)
+        logger.info("[FIREBASE] Inicializado correctamente desde variable de entorno.")
+    except Exception as e:
+        logger.error(f"[FIREBASE ERROR] Error parseando FIREBASE_CREDENTIALS: {e}")
+        raise e
+else:
+    if os.path.exists('serviceAccountKey.json'):
+        cred = credentials.Certificate('serviceAccountKey.json')
+        firebase_admin.initialize_app(cred)
+        logger.info("[FIREBASE] Inicializado desde serviceAccountKey.json local.")
+    else:
+        raise ValueError("Falta la variable FIREBASE_CREDENTIALS o el archivo local serviceAccountKey.json.")
+
+db = firestore.client()
+
+# =========================================================
+# 3. COLAS Y WORKERS
+# =========================================================
+pm_queue = queue.Queue()
+binance_queue = queue.Queue()
 processed_in_flight = set()
+lock_in_flight = threading.Lock()
 
-# --- HILOS TRABAJADORES (WORKERS) ---
 def pm_worker_loop():
-    logger.info("🏦 [WORKER BANCO] Hilo exclusivo de Pago Móvil iniciado.")
+    """Hilo para Pago Móvil (Conserva tu lógica de cierre de sesión a los 120s)"""
+    logger.info("👷 [WORKER BANCO] Hilo de procesamiento continuo iniciado.")
     while True:
         try:
-            # Si pasan 2 minutos sin pagos, se libera la cola y se cierra la sesión
-            order_id, datos_orden = pm_queue.get(timeout=120)
             try:
-                # LLAMADA AL MÓDULO AISLADO
-                pago_movil_bot.procesar_validacion_en_banco(order_id, datos_orden, db)
-            except Exception as e:
-                logger.error(f"❌ [WORKER BANCO ERROR] Error crítico en {order_id}: {e}")
-            finally:
-                with lock_in_flight:
-                    if order_id in processed_in_flight:
-                        processed_in_flight.remove(order_id)
-                pm_queue.task_done()
-        except queue.Empty:
-            pago_movil_bot.bank_manager.logout()
+                order_id, order_data = pm_queue.get(timeout=30)
+            except queue.Empty:
+                if pago_movil_bot.bank_manager.is_logged_in and (time.time() - pago_movil_bot.bank_manager.last_activity > 120):
+                    pago_movil_bot.bank_manager.logout()
+                continue
+
+            logger.info(f"📥 [WORKER] Extrayendo orden de la cola (Pago Móvil): {order_id}")
+            pago_movil_bot.procesar_validacion_en_banco(order_id, order_data, db)
+            
+            pm_queue.task_done()
+            with lock_in_flight:
+                processed_in_flight.discard(order_id)
+        except Exception as e:
+            logger.error(f"❌ [WORKER ERROR] Excepción no controlada en el worker loop (Banco): {e}")
+            time.sleep(2)
 
 def binance_worker_loop(worker_id):
+    """Hilos paralelos para Binance"""
     logger.info(f"🟡 [WORKER BINANCE {worker_id}] Hilo paralelo iniciado.")
     while True:
-        order_id, datos_orden = binance_queue.get()
         try:
-            # LLAMADA AL MÓDULO AISLADO
-            binance_bot.procesar_validacion_binance(order_id, datos_orden)
+            order_id, order_data = binance_queue.get()
+            binance_bot.procesar_validacion_binance(order_id, order_data)
         except Exception as e:
             logger.error(f"❌ [WORKER BINANCE ERROR] Error crítico en {order_id}: {e}")
         finally:
             with lock_in_flight:
-                if order_id in processed_in_flight:
-                    processed_in_flight.remove(order_id)
+                processed_in_flight.discard(order_id)
             binance_queue.task_done()
 
-# --- EL BARREDOR (SWEEPER) ---
-def recuperador_ordenes_pendientes():
-    logger.info("🧹 [SWEEPER] Hilo recuperador iniciado.")
-    while True:
-        try:
-            time.sleep(60) 
-            ahora = datetime.now(timezone.utc)
-            
-            ordenes = db.collection('store_orders') \
-                .where(filter=firestore.FieldFilter('status', '==', 'pending_retry')) \
-                .where(filter=firestore.FieldFilter('proximo_reintento', '<=', ahora)) \
-                .get()
-
-            for doc in ordenes:
-                order_id = doc.id
-                datos_orden = doc.to_dict()
-                
-                # --- CORRECCIÓN AQUÍ ---
-                payment_method = datos_orden.get('payment_method') or datos_orden.get('payment_details', {}).get('payment_method', '')
-                
-                if payment_method not in ['pago_movil', 'binance']:
-                    continue
-                
-                with lock_in_flight:
-                    if order_id not in processed_in_flight:
-                        processed_in_flight.add(order_id)
-                        
-                        if payment_method == 'pago_movil':
-                            pm_queue.put((order_id, datos_orden))
-                        elif payment_method == 'binance':
-                            binance_queue.put((order_id, datos_orden))
-        except Exception as e:
-            logger.error(f"❌ [SWEEPER ERROR] Fallo: {e}")
-
-# --- EL ESCUCHADOR (LISTENER) ---
+# =========================================================
+# 4. LISTENER EN TIEMPO REAL (FIRESTORE)
+# =========================================================
 def on_snapshot(col_snapshot, changes, read_time):
     for change in changes:
         if change.type.name == 'ADDED':
-            doc = change.document
-            order_id = doc.id
-            datos_orden = doc.to_dict()
+            order_id = change.document.id
+            order_data = change.document.to_dict()
             
-            # --- CORRECCIÓN AQUÍ ---
-            payment_method = datos_orden.get('payment_method') or datos_orden.get('payment_details', {}).get('payment_method', '')
+            # Búsqueda robusta de método de pago
+            payment_method = order_data.get('paymentMethod') or order_data.get('payment_method') or order_data.get('payment_details', {}).get('payment_method', '')
             
-            # REGLA ESTRICTA: Si no es un método conocido, se ignora y se deja en el limbo.
             if payment_method not in ['pago_movil', 'binance']:
-                logger.info(f"⏭️ [LISTENER] Orden {order_id} ignorada. Método desconocido o vacío: '{payment_method}'")
+                logger.info(f"⏭️ [LISTENER] Orden {order_id} ignorada. Método: '{payment_method}'")
                 continue 
-            
+
             with lock_in_flight:
-                if order_id not in processed_in_flight:
-                    processed_in_flight.add(order_id)
-                    
-                    if payment_method == 'pago_movil':
-                        logger.info(f"📥 [LISTENER] Orden a fila de Banco: {order_id}")
-                        pm_queue.put((order_id, datos_orden))
-                    elif payment_method == 'binance':
-                        logger.info(f"📥 [LISTENER] Orden a fila de Binance: {order_id}")
-                        binance_queue.put((order_id, datos_orden))
+                if order_id in processed_in_flight:
+                    continue
+                processed_in_flight.add(order_id)
 
-# --- INICIO DEL SISTEMA ---
+            logger.info(f"⚡ [FIRESTORE EVENT] Nueva orden encolada ({payment_method}): {order_id}")
+            
+            if payment_method == 'pago_movil':
+                pm_queue.put((order_id, order_data))
+            elif payment_method == 'binance':
+                binance_queue.put((order_id, order_data))
+
 def start_bot_services():
-    # 1 hilo para el banco, 3 hilos paralelos para Binance
-    threading.Thread(target=pm_worker_loop, daemon=True, name="Worker-Banco").start()
+    # Hilo exclusivo para Pago Móvil
+    threading.Thread(target=pm_worker_loop, daemon=True).start()
+    
+    # 3 Hilos paralelos para Binance
     for i in range(3):
-        threading.Thread(target=binance_worker_loop, args=(i+1,), daemon=True, name=f"Worker-Binance-{i+1}").start()
-
-    threading.Thread(target=recuperador_ordenes_pendientes, daemon=True, name="Sweeper").start()
+        threading.Thread(target=binance_worker_loop, args=(i+1,), daemon=True).start()
 
     try:
-        logger.info("🚀 [BOT] Conectando a Firestore...")
-        db.collection('store_orders').where(filter=firestore.FieldFilter('status', '==', 'pending_verification')).on_snapshot(on_snapshot)
-        logger.info("✅ [BOT] Sistema operativo. Escuchando compras...")
+        logger.info("🚀 [BOT] Iniciando Listener de Firestore para 'store_orders'...")
+        orders_ref = db.collection('store_orders').where('status', '==', 'pending_verification')
+        orders_ref.on_snapshot(on_snapshot)
+        logger.info("✅ [BOT] Listener activo y escuchando compras pendientes.")
     except Exception as e:
-        logger.error(f"❌ [BOT ERROR] Listener falló: {e}")
+        logger.error(f"❌ [BOT ERROR] Falló al iniciar el Listener de Firestore: {e}")
 
 start_bot_services()
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
