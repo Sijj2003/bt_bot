@@ -5,6 +5,7 @@ import email
 import re
 import logging
 from datetime import datetime, timedelta, timezone
+from bs4 import BeautifulSoup
 from firebase_admin import firestore
 
 logger = logging.getLogger(__name__)
@@ -19,11 +20,15 @@ def buscar_recibo_en_correo(referencia, monto_esperado):
         mail.login(EMAIL_ACCOUNT, EMAIL_PASSWORD)
         mail.select('inbox')
 
-        fecha_ayer = (datetime.now() - timedelta(days=1)).strftime("%d-%b-%Y")
+        # Formato de fecha en inglés estricto para que Render no falle
+        meses = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+        ayer = datetime.now(timezone.utc) - timedelta(days=1)
+        fecha_ayer = f"{ayer.day:02d}-{meses[ayer.month - 1]}-{ayer.year}"
+
         status, mensajes = mail.search(None, f'(FROM "binance" SINCE "{fecha_ayer}")')
 
-        if status != 'OK':
-            return False, "No se pudo acceder a la bandeja de entrada."
+        if status != 'OK' or not mensajes[0]:
+            return False, "Bandeja vacía o sin correos de Binance."
 
         lista_ids = mensajes[0].split()
         
@@ -36,10 +41,16 @@ def buscar_recibo_en_correo(referencia, monto_esperado):
                     cuerpo = ""
                     if msg.is_multipart():
                         for part in msg.walk():
-                            if part.get_content_type() in ["text/plain", "text/html"]:
-                                cuerpo += part.get_payload(decode=True).decode('utf-8', errors='ignore')
+                            if part.get_content_type() == "text/plain":
+                                cuerpo += part.get_payload(decode=True).decode('utf-8', errors='ignore') + " "
+                            elif part.get_content_type() == "text/html":
+                                html_content = part.get_payload(decode=True).decode('utf-8', errors='ignore')
+                                # Lector inteligente que extrae solo texto del diseño de Binance
+                                cuerpo += BeautifulSoup(html_content, "html.parser").get_text(separator=' ') + " "
                     else:
                         cuerpo = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
+                        if msg.get_content_type() == "text/html":
+                            cuerpo = BeautifulSoup(cuerpo, "html.parser").get_text(separator=' ')
 
                     cuerpo_limpio = re.sub(r'\s+', ' ', cuerpo).lower()
                     referencia_limpia = str(referencia).strip().lower()
@@ -58,7 +69,7 @@ def buscar_recibo_en_correo(referencia, monto_esperado):
 
     except Exception as e:
         logger.error(f"Error conectando al correo: {e}")
-        raise e
+        return False, f"Fallo de conexión IMAP: {e}"
 
 def procesar_validacion_binance(order_id, datos_orden):
     db = firestore.client()
@@ -93,17 +104,17 @@ def procesar_validacion_binance(order_id, datos_orden):
             minutos_espera = 2 
             proximo_reintento = datetime.now(timezone.utc) + timedelta(minutes=minutos_espera)
             
-            logger.info(f"⏳ [BINANCE] Orden {order_id}: Correo no recibido aún. Intento {intentos_actuales}/{max_reintentos}.")
+            logger.info(f"⏳ [BINANCE] Orden {order_id}: Correo no detectado. Intento {intentos_actuales}/{max_reintentos}.")
             
             order_ref.update({
                 'status': 'pending_retry',
                 'reintentos': intentos_actuales,
                 'proximo_reintento': proximo_reintento,
-                'bot_verification_msg': f"Esperando notificación del pago... Intento {intentos_actuales} de {max_reintentos}."
+                'bot_verification_msg': f"Esperando correo de Binance Pay... Intento {intentos_actuales} de {max_reintentos}."
             })
         else:
-            logger.warning(f"🚫 [BINANCE] Orden {order_id} RECHAZADA. El recibo nunca llegó.")
+            logger.warning(f"🚫 [BINANCE] Orden {order_id} RECHAZADA. El recibo nunca coincidió.")
             order_ref.update({
                 'status': 'rejected',
-                'bot_verification_msg': "No se recibió confirmación de Binance Pay tras 10 minutos de espera. Revise que su Nickname esté bien escrito."
+                'bot_verification_msg': "No se recibió confirmación de Binance tras 10 minutos de espera."
             })
