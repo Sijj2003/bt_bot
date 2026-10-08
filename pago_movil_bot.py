@@ -3,7 +3,7 @@ import time
 import re
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import requests
 from bs4 import BeautifulSoup
 from firebase_admin import firestore
@@ -235,6 +235,10 @@ def procesar_validacion_en_banco(order_id, datos_orden, db):
 
     order_ref = db.collection('store_orders').document(order_id)
     
+    # --- VARIABLES DE REINTENTO ---
+    max_reintentos = 3
+    intentos_actuales = datos_orden.get("reintentos", 0)
+
     try:
         order_ref.update({'verification_started_at': firestore.SERVER_TIMESTAMP})
     except Exception as e:
@@ -303,15 +307,30 @@ def procesar_validacion_en_banco(order_id, datos_orden, db):
             logger.warning(f"🚫 [FIRESTORE] Orden {order_id} RECHAZADA (No encontrado en el banco).")
 
         elif dictamen == "BANCO_DOWN":
-            order_ref.update({
-                'bot_verification_msg': f"Revisión en pausa: {mensaje_banco}"
-            })
-            logger.warning(f"⚠️ [FIRESTORE] Orden {order_id} mantenida en espera por problemas de conectividad.")
+            # Forzamos una excepción para que caiga en el bloque de reintentos
+            raise Exception(f"Banco en mantenimiento o caído: {mensaje_banco}")
 
     except Exception as e:
-        logger.error(f"❌ [BOT EXCEPCIÓN] Error crítico procesando la orden {order_id}: {e}")
-        order_ref.update({
-            'bot_verification_msg': f"Error técnico / Revisión manual: {str(e)}"
-        })
+        # --- LÓGICA DE REINTENTOS (Caja bloqueada, red caída, etc.) ---
+        intentos_actuales += 1
+        logger.warning(f"⚠️ [BOT EXCEPCIÓN] Error en orden {order_id}: {e}. Intento {intentos_actuales}/{max_reintentos}")
+        
+        if intentos_actuales < max_reintentos:
+            minutos_espera = 3
+            proximo_reintento = datetime.now(timezone.utc) + timedelta(minutes=minutos_espera)
+            
+            order_ref.update({
+                'status': 'pending_retry',
+                'reintentos': intentos_actuales,
+                'proximo_reintento': proximo_reintento,
+                'bot_verification_msg': f"Caja ocupada o error de conexión. Reintentando en {minutos_espera} min (Intento {intentos_actuales} de {max_reintentos})."
+            })
+            logger.info(f"⏳ [REINTENTO] Orden {order_id} enviada al Sweeper (Reintento en {minutos_espera} min).")
+        else:
+            order_ref.update({
+                'status': 'manual_review',
+                'bot_verification_msg': f"Se agotaron los {max_reintentos} reintentos. Error: {str(e)}"
+            })
+            logger.error(f"🚨 [SISTEMA] Orden {order_id} agotó reintentos. Pasando a revisión manual.")
     finally:
         print("="*80 + "\n")
