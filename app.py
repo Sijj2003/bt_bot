@@ -204,12 +204,22 @@ def on_snapshot(col_snapshot, changes, read_time):
         if change.type.name == 'ADDED':
             doc = change.document
             order_id = doc.id
+            datos_orden = doc.to_dict()
+            
+            # --- NUEVO: FILTRO ESTRICTO DE MÉTODO DE PAGO ---
+            payment_details = datos_orden.get('payment_details', {})
+            payment_method = payment_details.get('payment_method', '')
+            
+            if payment_method != 'pago_movil':
+                logger.info(f"⏭️ [LISTENER] Orden {order_id} ignorada. Es método: {payment_method}")
+                continue # Salta a la siguiente orden sin procesarla
+            # ------------------------------------------------
             
             with lock_in_flight:
                 if order_id not in processed_in_flight:
                     processed_in_flight.add(order_id)
-                    logger.info(f"📥 [LISTENER] Nueva orden ingresada: {order_id}")
-                    order_queue.put((order_id, doc.to_dict()))
+                    logger.info(f"📥 [LISTENER] Nueva orden de Pago Móvil ingresada: {order_id}")
+                    order_queue.put((order_id, datos_orden))
 
 def start_bot_services():
     threading.Thread(target=worker_loop, daemon=True).start()
