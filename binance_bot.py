@@ -121,8 +121,10 @@ def procesar_validacion_binance(order_id, datos_orden):
             # 🛡️ EL CANDADO ATÓMICO (Anti-Condición de Carrera)
             # ========================================================
             try:
-                # Intentamos registrar el uso del correo. Si otro hilo lo hace al mismo tiempo, esto explotará.
-                db.collection('used_payments_registry').document(f"binance_{msg_id}").create({
+                # Reemplazamos cualquier barra inclinada por un guion bajo por si acaso
+                safe_msg_id = msg_id.replace('/', '_')
+                
+                db.collection('used_payments_registry').document(f"binance_{safe_msg_id}").create({
                     'order_id': order_id,
                     'method': 'binance',
                     'timestamp': firestore.SERVER_TIMESTAMP
