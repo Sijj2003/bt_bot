@@ -193,11 +193,19 @@ def recuperador_ordenes_pendientes():
 
             for doc in ordenes:
                 order_id = doc.id
+                datos_orden = doc.to_dict()
+                
+                # --- FILTRO ESTRICTO TAMBIÉN EN EL BARREDOR ---
+                payment_details = datos_orden.get('payment_details', {})
+                if payment_details.get('payment_method') != 'pago_movil':
+                    continue
+                # ----------------------------------------------
+                
                 with lock_in_flight:
                     if order_id not in processed_in_flight:
                         processed_in_flight.add(order_id)
                         logger.info(f"🔄 [SWEEPER] Re-encolando orden atascada: {order_id}")
-                        order_queue.put((order_id, doc.to_dict()))
+                        order_queue.put((order_id, datos_orden))
         except Exception as e:
             logger.error(f"❌ [SWEEPER ERROR] Fallo: {e}")
 
