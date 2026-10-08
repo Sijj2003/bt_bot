@@ -9,7 +9,6 @@ from firebase_admin import firestore
 
 logger = logging.getLogger(__name__)
 
-# Credenciales de correo configuradas en Render
 EMAIL_ACCOUNT = os.environ.get("BINANCE_EMAIL", "sijj2003@gmail.com")
 EMAIL_PASSWORD = os.environ.get("BINANCE_EMAIL_PASSWORD", "")
 IMAP_SERVER = "imap.gmail.com"
@@ -62,14 +61,12 @@ def buscar_recibo_en_correo(referencia, monto_esperado):
         raise e
 
 def procesar_validacion_binance(order_id, datos_orden):
-    # INICIALIZACIÓN DIFERIDA: Se conecta a Firebase solo cuando se llama a la función
     db = firestore.client()
     
     logger.info(f"🟡 [BINANCE WORKER] Iniciando validación para orden {order_id}...")
     order_ref = db.collection('store_orders').document(order_id)
     
     payment_details = datos_orden.get('payment_details', {})
-    
     referencia_usuario = payment_details.get('referencia', '').strip()
     monto_esperado = float(datos_orden.get('total_usd', 0))
 
