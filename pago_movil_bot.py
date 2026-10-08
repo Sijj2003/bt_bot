@@ -7,6 +7,7 @@ from datetime import datetime, timezone, timedelta
 import requests
 from bs4 import BeautifulSoup
 from firebase_admin import firestore
+from google.api_core.exceptions import AlreadyExists
 
 logger = logging.getLogger(__name__)
 
@@ -276,12 +277,35 @@ def procesar_validacion_en_banco(order_id, datos_orden, db):
         dictamen, mensaje_banco = evaluar_respuesta_banco(res_val)
 
         if dictamen == "APROBADO":
-            order_ref.update({
-                'status': 'approved',
-                'bot_verification_msg': mensaje_banco,
-                'verified_at': firestore.SERVER_TIMESTAMP
-            })
-            logger.info(f"🎉 [FIRESTORE] Orden {order_id} APROBADA.")
+            # 1. Creamos un ID único usando la referencia de 6 dígitos y la fecha actual
+            fecha_hoy = datetime.now(timezone.utc).strftime('%Y%m%d')
+            candado_id = f"pm_{ref_6_digitos}_{fecha_hoy}"
+
+            # ========================================================
+            # 🛡️ EL CANDADO ATÓMICO (Anti-Condición de Carrera)
+            # ========================================================
+            try:
+                # Intentamos registrar el candado. Si 5 workers intentan esto, solo 1 pasará.
+                db.collection('used_payments_registry').document(candado_id).create({
+                    'order_id': order_id,
+                    'method': 'pago_movil',
+                    'timestamp': firestore.SERVER_TIMESTAMP
+                })
+                
+                order_ref.update({
+                    'status': 'approved',
+                    'bot_verification_msg': mensaje_banco,
+                    'verified_at': firestore.SERVER_TIMESTAMP
+                })
+                logger.info(f"🎉 [FIRESTORE] Orden {order_id} APROBADA y Sellada Atómicamente.")
+                
+            except AlreadyExists:
+                # Hacker atrapado: Otra orden simultánea acaba de reclamar esta misma referencia
+                logger.warning(f"🚨 [ATAQUE SIMULTÁNEO] La referencia PM {ref_6_digitos} ya fue reclamada.")
+                order_ref.update({
+                    'status': 'rejected',
+                    'bot_verification_msg': "Pago rechazado: Intento de doble uso simultáneo detectado."
+                })
 
         elif dictamen == "YA_UTILIZADO":
             es_aprobado_recuperado, msg_resolucion = resolver_falso_positivo_ya_utilizado(order_id, ref_6_digitos, datos_orden, db)
