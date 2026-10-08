@@ -17,7 +17,7 @@ class BankSessionManager:
     def __init__(self):
         self.session = requests.Session()
         self.is_logged_in = False
-        self.base_url = "https://URL_DE_TU_BANCO.com" # <- AJUSTA ESTO
+        self.base_url = "https://tesoropagos.bt.com.ve/login" # <- AJUSTA ESTO
 
     def login(self):
         try:
