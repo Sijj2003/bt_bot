@@ -7,6 +7,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from bs4 import BeautifulSoup
 from firebase_admin import firestore
+from google.api_core.exceptions import AlreadyExists
 
 logger = logging.getLogger(__name__)
 
@@ -116,13 +117,32 @@ def procesar_validacion_binance(order_id, datos_orden):
         encontrado, mensaje, msg_id = buscar_recibo_en_correo(referencia_usuario, monto_esperado, db, order_id)
         
         if encontrado:
-            logger.info(f"🎉 [BINANCE] Orden {order_id} APROBADA.")
-            order_ref.update({
-                'status': 'approved',
-                'bot_verification_msg': mensaje,
-                'binance_email_id': msg_id, # 🔒 Sellamos la orden guardando el ID único del correo
-                'verified_at': firestore.SERVER_TIMESTAMP
-            })
+            # ========================================================
+            # 🛡️ EL CANDADO ATÓMICO (Anti-Condición de Carrera)
+            # ========================================================
+            try:
+                # Intentamos registrar el uso del correo. Si otro hilo lo hace al mismo tiempo, esto explotará.
+                db.collection('used_payments_registry').document(f"binance_{msg_id}").create({
+                    'order_id': order_id,
+                    'method': 'binance',
+                    'timestamp': firestore.SERVER_TIMESTAMP
+                })
+                
+                logger.info(f"🎉 [BINANCE] Orden {order_id} APROBADA.")
+                order_ref.update({
+                    'status': 'approved',
+                    'bot_verification_msg': mensaje,
+                    'binance_email_id': msg_id,
+                    'verified_at': firestore.SERVER_TIMESTAMP
+                })
+                
+            except AlreadyExists:
+                # ¡Hacker atrapado! Otro hilo reclamó este pago en el mismo milisegundo.
+                logger.warning(f"🚨 [ATAQUE SIMULTÁNEO] El recibo Binance {msg_id} ya fue reclamado.")
+                order_ref.update({
+                    'status': 'rejected',
+                    'bot_verification_msg': "Pago rechazado: Intento de doble uso simultáneo detectado."
+                })
         else:
             raise Exception("NoEncontrado")
 
