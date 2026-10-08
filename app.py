@@ -92,11 +92,14 @@ def procesar_validacion_en_banco(order_id, datos_orden):
     logger.info(f"⚙️ [PROCESANDO] Iniciando validación para orden {order_id}...")
     order_ref = db.collection('store_orders').document(order_id)
     
+    # --- CORRECCIÓN: Extraer del mapa 'payment_details' ---
+    payment_details = datos_orden.get('payment_details', {})
+    
     payload_val = {
-        'monto': datos_orden.get('monto'),
-        'banco': datos_orden.get('banco'),
-        'telefono': datos_orden.get('telefono'),
-        'referencia': datos_orden.get('referencia')
+        'monto': payment_details.get('monto_bot'),
+        'banco': payment_details.get('banco'),
+        'telefono': payment_details.get('telefono'),
+        'referencia': payment_details.get('referencia')
     }
 
     max_reintentos = 3
