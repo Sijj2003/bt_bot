@@ -8,6 +8,9 @@ from datetime import datetime, timedelta, timezone
 import firebase_admin
 from firebase_admin import credentials, firestore
 
+# --- IMPORTAMOS EL NUEVO MÓDULO DE BINANCE ---
+import binance_bot 
+
 # --- 1. CONFIGURACIÓN Y LOGS ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -22,8 +25,10 @@ try:
 except Exception as e:
     logger.error(f"❌ Error al inicializar Firebase: {e}")
 
-# --- 3. VARIABLES GLOBALES Y CONTROL DE CONCURRENCIA ---
-order_queue = queue.Queue()
+# --- 3. VARIABLES GLOBALES Y CONTROL DE CONCURRENCIA (DOBLE COLA) ---
+pm_queue = queue.Queue()       # Fila exclusiva para Pago Móvil (1 hilo)
+binance_queue = queue.Queue()  # Fila paralela para Binance (3 hilos)
+
 lock_in_flight = threading.Lock()
 processed_in_flight = set()
 
@@ -39,11 +44,11 @@ class BankSessionManager:
     def __init__(self):
         self.session = requests.Session()
         self.is_logged_in = False
-        self.base_url = "https://URL_DE_TU_BANCO.com" # <- AJUSTA ESTO: URL base del banco
+        self.base_url = "https://URL_DE_TU_BANCO.com" # <- AJUSTA ESTO
 
     def login(self):
         try:
-            # <- AJUSTA ESTO: Aquí va tu lógica real de inicio de sesión con requests
+            # <- AJUSTA ESTO: Aquí va tu lógica real de inicio de sesión
             res_login = self.session.post(
                 f"{self.base_url}/login", 
                 data={"usuario": "tu_usuario", "clave": "tu_clave"}, 
@@ -51,7 +56,6 @@ class BankSessionManager:
             )
             location = res_login.headers.get('Location', '')
             
-            # DETECCIÓN DE CAJA BLOQUEADA
             if res_login.status_code != 302 or 'login' in location:
                 self.is_logged_in = False
                 raise BancoCajaBloqueadaException("Credenciales rechazadas o la caja del banco está ocupada.")
@@ -64,35 +68,33 @@ class BankSessionManager:
     def consultar(self, payload):
         if not self.is_logged_in:
             self.login()
-        # <- AJUSTA ESTO: Aquí va tu petición real de consulta al banco
         res = self.session.post(f"{self.base_url}/consultar", data=payload)
         return res
+
+    def logout(self):
+        """Cierra la sesión de forma limpia para liberar la caja del banco"""
+        if self.is_logged_in:
+            logger.info("🔒 Cerrando sesión del banco por inactividad (2 min sin pagos móviles).")
+            # self.session.post(f"{self.base_url}/logout") # Descomenta y ajusta si tu banco exige un endpoint de logout
+            self.session.close()
+            self.session = requests.Session() # Reinicia la sesión limpia
+            self.is_logged_in = False
 
 bank_manager = BankSessionManager()
 
 # --- 6. FUNCIONES DE EVALUACIÓN ---
 def evaluar_respuesta_banco(res_val):
-    """
-    <- AJUSTA ESTO: Pega aquí tu código que lee la respuesta del banco (BeautifulSoup o JSON).
-    Debe retornar dos cosas: Un dictamen y un mensaje.
-    Ejemplo de retorno: return "APROBADO", "Pago encontrado"
-    """
     # Lógica simulada por ahora:
     return "NO_ENCONTRADO", "Aún no se ha implementado el scraping real."
 
 def resolver_falso_positivo_ya_utilizado(order_id, ref_6_digitos, datos_orden):
-    """
-    <- AJUSTA ESTO: Pega aquí tu lógica para saber si un pago usado te pertenece.
-    Debe retornar un booleano (True/False) y un mensaje.
-    """
     return False, "Referencia ya fue usada por otra orden."
 
-# --- 7. NÚCLEO DE VALIDACIÓN Y REINTENTOS ---
+# --- 7. NÚCLEO DE VALIDACIÓN Y REINTENTOS (BANCARIO) ---
 def procesar_validacion_en_banco(order_id, datos_orden):
     logger.info(f"⚙️ [PROCESANDO] Iniciando validación para orden {order_id}...")
     order_ref = db.collection('store_orders').document(order_id)
     
-    # --- CORRECCIÓN: Extraer del mapa 'payment_details' ---
     payment_details = datos_orden.get('payment_details', {})
     
     payload_val = {
@@ -106,14 +108,12 @@ def procesar_validacion_en_banco(order_id, datos_orden):
     intentos_actuales = datos_orden.get("reintentos", 0)
 
     try:
-        # Ejecutar consulta
         res_val = bank_manager.consultar(payload_val)
         dictamen, mensaje_banco = evaluar_respuesta_banco(res_val)
         
         if dictamen == "BANCO_DOWN":
             raise BancoMantenimientoException(mensaje_banco)
 
-        # Lógica de estados en Firestore
         if dictamen == "APROBADO":
             order_ref.update({
                 'status': 'approved',
@@ -136,7 +136,6 @@ def procesar_validacion_en_banco(order_id, datos_orden):
             logger.warning(f"🚫 [FIRESTORE] Orden {order_id} RECHAZADA (No encontrado).")
 
     except (BancoCajaBloqueadaException, BancoMantenimientoException, requests.exceptions.RequestException) as e:
-        # MANEJO DE BLOQUEOS (Caja ocupada o Red caída)
         intentos_actuales += 1
         logger.warning(f"⚠ [INFRAESTRUCTURA] {str(e)}. Intento {intentos_actuales}/{max_reintentos}.")
         
@@ -158,34 +157,51 @@ def procesar_validacion_en_banco(order_id, datos_orden):
                 'bot_verification_msg': "Exceso de reintentos: Banco no responde o caja permanentemente bloqueada."
             })
     finally:
-        # IMPORTANTE: Liberar la orden de la memoria sin importar si falló o tuvo éxito
         with lock_in_flight:
             if order_id in processed_in_flight:
                 processed_in_flight.remove(order_id)
 
-# --- 8. HILOS (WORKER Y SWEEPER) ---
-def worker_loop():
-    logger.info("👷 [WORKER] Hilo procesador iniciado.")
+# --- 8. HILOS (WORKERS Y SWEEPER ENRUTADORES) ---
+def pm_worker_loop():
+    logger.info("🏦 [WORKER BANCO] Hilo exclusivo de Pago Móvil iniciado (Sesión única).")
     while True:
-        order_id, datos_orden = order_queue.get()
         try:
-            procesar_validacion_en_banco(order_id, datos_orden)
+            # Esperamos máximo 120 segundos (2 minutos) por una orden en la fila
+            order_id, datos_orden = pm_queue.get(timeout=120)
+            try:
+                procesar_validacion_en_banco(order_id, datos_orden)
+            except Exception as e:
+                logger.error(f"❌ [WORKER BANCO ERROR] Error crítico en {order_id}: {e}")
+                with lock_in_flight:
+                    if order_id in processed_in_flight:
+                        processed_in_flight.remove(order_id)
+            finally:
+                pm_queue.task_done()
+        except queue.Empty:
+            # Si pasan 2 minutos y la fila está vacía (timeout), cerramos la sesión
+            bank_manager.logout()
+
+def binance_worker_loop(worker_id):
+    logger.info(f"🟡 [WORKER BINANCE {worker_id}] Hilo paralelo iniciado.")
+    while True:
+        order_id, datos_orden = binance_queue.get()
+        try:
+            binance_bot.procesar_validacion_binance(order_id, datos_orden)
         except Exception as e:
-            logger.error(f"❌ [WORKER ERROR] Error crítico en {order_id}: {e}")
+            logger.error(f"❌ [WORKER BINANCE ERROR] Error crítico en {order_id}: {e}")
             with lock_in_flight:
                 if order_id in processed_in_flight:
                     processed_in_flight.remove(order_id)
         finally:
-            order_queue.task_done()
+            binance_queue.task_done()
 
 def recuperador_ordenes_pendientes():
     logger.info("🧹 [SWEEPER] Hilo recuperador iniciado.")
     while True:
         try:
-            time.sleep(60) # Revisa Firestore cada 60 segundos
+            time.sleep(60) 
             ahora = datetime.now(timezone.utc)
             
-            # Busca órdenes que estaban en pausa y ya pasó su tiempo
             ordenes = db.collection('store_orders') \
                 .where('status', '==', 'pending_retry') \
                 .where('proximo_reintento', '<=', ahora) \
@@ -195,17 +211,22 @@ def recuperador_ordenes_pendientes():
                 order_id = doc.id
                 datos_orden = doc.to_dict()
                 
-                # --- FILTRO ESTRICTO TAMBIÉN EN EL BARREDOR ---
                 payment_details = datos_orden.get('payment_details', {})
-                if payment_details.get('payment_method') != 'pago_movil':
+                payment_method = payment_details.get('payment_method', '')
+                
+                if payment_method not in ['pago_movil', 'binance']:
                     continue
-                # ----------------------------------------------
                 
                 with lock_in_flight:
                     if order_id not in processed_in_flight:
                         processed_in_flight.add(order_id)
-                        logger.info(f"🔄 [SWEEPER] Re-encolando orden atascada: {order_id}")
-                        order_queue.put((order_id, datos_orden))
+                        
+                        if payment_method == 'pago_movil':
+                            logger.info(f"🔄 [SWEEPER] Re-encolando Pago Móvil atascado: {order_id}")
+                            pm_queue.put((order_id, datos_orden))
+                        elif payment_method == 'binance':
+                            logger.info(f"🔄 [SWEEPER] Re-encolando Binance atascado: {order_id}")
+                            binance_queue.put((order_id, datos_orden))
         except Exception as e:
             logger.error(f"❌ [SWEEPER ERROR] Fallo: {e}")
 
@@ -217,24 +238,33 @@ def on_snapshot(col_snapshot, changes, read_time):
             order_id = doc.id
             datos_orden = doc.to_dict()
             
-            # --- NUEVO: FILTRO ESTRICTO DE MÉTODO DE PAGO ---
             payment_details = datos_orden.get('payment_details', {})
             payment_method = payment_details.get('payment_method', '')
             
-            if payment_method != 'pago_movil':
-                logger.info(f"⏭️ [LISTENER] Orden {order_id} ignorada. Es método: {payment_method}")
-                continue # Salta a la siguiente orden sin procesarla
-            # ------------------------------------------------
+            if payment_method not in ['pago_movil', 'binance']:
+                continue 
             
             with lock_in_flight:
                 if order_id not in processed_in_flight:
                     processed_in_flight.add(order_id)
-                    logger.info(f"📥 [LISTENER] Nueva orden de Pago Móvil ingresada: {order_id}")
-                    order_queue.put((order_id, datos_orden))
+                    
+                    if payment_method == 'pago_movil':
+                        logger.info(f"📥 [LISTENER] Orden a fila de Banco: {order_id}")
+                        pm_queue.put((order_id, datos_orden))
+                    elif payment_method == 'binance':
+                        logger.info(f"📥 [LISTENER] Orden a fila de Binance: {order_id}")
+                        binance_queue.put((order_id, datos_orden))
 
 def start_bot_services():
-    threading.Thread(target=worker_loop, daemon=True).start()
-    threading.Thread(target=recuperador_ordenes_pendientes, daemon=True).start()
+    # 1. Hilo exclusivo del Banco (gestiona la sesión única y su timeout)
+    threading.Thread(target=pm_worker_loop, daemon=True, name="Worker-Banco").start()
+    
+    # 2. Hilos de Binance (3 procesos en paralelo para rapidez)
+    for i in range(3):
+        threading.Thread(target=binance_worker_loop, args=(i+1,), daemon=True, name=f"Worker-Binance-{i+1}").start()
+
+    # 3. Barredor de reintentos
+    threading.Thread(target=recuperador_ordenes_pendientes, daemon=True, name="Sweeper").start()
 
     try:
         logger.info("🚀 [BOT] Conectando a Firestore...")
@@ -243,7 +273,6 @@ def start_bot_services():
     except Exception as e:
         logger.error(f"❌ [BOT ERROR] Listener falló: {e}")
     
-    # Mantiene el bot vivo
     while True:
         time.sleep(3600)
 
