@@ -97,8 +97,8 @@ def recuperador_ordenes_pendientes():
                 order_id = doc.id
                 datos_orden = doc.to_dict()
                 
-                payment_details = datos_orden.get('payment_details', {})
-                payment_method = payment_details.get('payment_method', '')
+                # --- CORRECCIÓN AQUÍ ---
+                payment_method = datos_orden.get('payment_method') or datos_orden.get('payment_details', {}).get('payment_method', '')
                 
                 if payment_method not in ['pago_movil', 'binance']:
                     continue
@@ -122,8 +122,8 @@ def on_snapshot(col_snapshot, changes, read_time):
             order_id = doc.id
             datos_orden = doc.to_dict()
             
-            payment_details = datos_orden.get('payment_details', {})
-            payment_method = payment_details.get('payment_method', '')
+            # --- CORRECCIÓN AQUÍ ---
+            payment_method = datos_orden.get('payment_method') or datos_orden.get('payment_details', {}).get('payment_method', '')
             
             # REGLA ESTRICTA: Si no es un método conocido, se ignora y se deja en el limbo.
             if payment_method not in ['pago_movil', 'binance']:
