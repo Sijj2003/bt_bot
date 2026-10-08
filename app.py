@@ -4,6 +4,7 @@ import threading
 import queue
 import requests
 import logging
+import json
 from datetime import datetime, timedelta, timezone
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -24,12 +25,22 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # --- 2. INICIALIZACIÓN DE FIREBASE ---
+# --- 2. INICIALIZACIÓN DE FIREBASE ---
 try:
-    # <- AJUSTA ESTO: Pon el nombre real de tu archivo JSON de credenciales de Firebase
-    cred = credentials.Certificate("credenciales_firebase.json") 
+    # Leemos el JSON de credenciales desde la variable de entorno de Render
+    firebase_creds_str = os.environ.get("FIREBASE_CREDENTIALS")
+    
+    if not firebase_creds_str:
+        raise ValueError("La variable de entorno FIREBASE_CREDENTIALS está vacía o no existe.")
+        
+    # Convertimos el string a un diccionario de Python
+    cred_dict = json.loads(firebase_creds_str)
+    
+    # Inicializamos Firebase con el diccionario
+    cred = credentials.Certificate(cred_dict) 
     firebase_admin.initialize_app(cred)
     db = firestore.client()
-    logger.info("✅ Firebase inicializado correctamente.")
+    logger.info("✅ Firebase inicializado correctamente desde variables de entorno.")
 except Exception as e:
     logger.error(f"❌ Error al inicializar Firebase: {e}")
 
