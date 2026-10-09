@@ -109,7 +109,7 @@ def procesar_validacion_binance(order_id, datos_orden):
     referencia_usuario = payment_details.get('referencia', '').strip()
     monto_esperado = float(datos_orden.get('total_usd', 0))
 
-    max_reintentos = 5
+    max_reintentos = 3
     intentos_actuales = datos_orden.get("reintentos", 0)
 
     try:
@@ -152,7 +152,7 @@ def procesar_validacion_binance(order_id, datos_orden):
         intentos_actuales += 1
         
         if intentos_actuales < max_reintentos:
-            minutos_espera = 2 
+            minutos_espera = 1 
             proximo_reintento = datetime.now(timezone.utc) + timedelta(minutes=minutos_espera)
             
             logger.info(f"⏳ [BINANCE] Orden {order_id}: Correo no detectado o ya usado. Intento {intentos_actuales}/{max_reintentos}.")
