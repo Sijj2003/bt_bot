@@ -5,6 +5,7 @@ import base64
 import queue
 import threading
 import logging
+from datetime import datetime, timezone
 from flask import Flask
 import firebase_admin
 from firebase_admin import credentials, firestore
@@ -30,7 +31,7 @@ def health_check():
     return "Gymenez Bot Worker is Active and Listening!", 200
 
 # =========================================================
-# 2. INICIALIZACIÓN DE FIREBASE ADMIN (Tu lógica base64)
+# 2. INICIALIZACIÓN DE FIREBASE ADMIN
 # =========================================================
 firebase_credentials_raw = os.environ.get('FIREBASE_CREDENTIALS')
 
@@ -108,11 +109,11 @@ def mrw_worker_loop():
     logger.info("📦 [WORKER MRW] Hilo logístico iniciado.")
     while True:
         try:
-            # Esperamos acumular paquetes en la cola (o ejecutamos cada 5 minutos)
-            time.sleep(300) 
-            items = []
+            # 1. Queda en pausa automáticamente hasta que entre un paquete a la cola
+            order_id, order_data = mrw_queue.get()
+            items = [(order_id, order_data)]
             
-            # Vaciamos toda la cola actual
+            # 2. Vaciamos el resto de la cola por si entraron varios de golpe
             try:
                 while True:
                     items.append(mrw_queue.get_nowait())
@@ -120,75 +121,106 @@ def mrw_worker_loop():
                 pass
 
             if items:
-                batch = db.batch() # <-- INICIAMOS EL LOTE DE ESCRITURA
+                batch = db.batch()
                 requiere_escritura = False
+                ahora_ts = datetime.now(timezone.utc).timestamp()
 
-                for order_id, order_data in items:
-                    nro_guia = order_data.get('nro_guia')
+                for oid, odata in items:
+                    nro_guia = odata.get('nro_guia')
                     if nro_guia:
                         resultado = mrw_bot.consultar_guia(nro_guia)
 
                         if resultado.get("valido"):
-                            ref_doc = db.collection('store_orders').document(order_id)
-                            # Si ya se entregó, lo pasamos a completado. Si no, sigue enviado.
+                            ref_doc = db.collection('store_orders').document(oid)
                             nuevo_estatus = "completado" if resultado["estatus_actual"] == "Entregado" else "enviado"
                             
-                            batch.update(ref_doc, {
+                            # Preparamos el paquete de actualización
+                            update_data = {
                                 "status": nuevo_estatus,
                                 "historial_envio": resultado["historial"],
-                                "ubicacion_paquete": resultado["ubicacion_actual"]
-                            })
+                                "ubicacion_paquete": resultado["ubicacion_actual"],
+                                "ultima_revision_mrw": ahora_ts  # ⏱️ Sello de la última revisión
+                            }
+                            
+                            # 📅 Si es la primera vez que se revisa, sellamos el inicio del tracking
+                            if not odata.get('fecha_inicio_tracking'):
+                                update_data['fecha_inicio_tracking'] = ahora_ts
+                            
+                            batch.update(ref_doc, update_data)
                             requiere_escritura = True
 
                     mrw_queue.task_done()
                     with lock_in_flight:
-                        processed_in_flight.discard(order_id)
+                        processed_in_flight.discard(oid)
 
-                # Mandamos a guardar TODAS las guías en 1 sola operación a Firebase
                 if requiere_escritura:
                     batch.commit()
-                    logger.info(f"✅ [BATCH WRITE] Se actualizaron {len(items)} envíos en Firestore simultáneamente.")
+                    logger.info(f"✅ [BATCH WRITE] Se actualizaron {len(items)} envíos logísticos en Firestore.")
 
         except Exception as e:
             logger.error(f"❌ [WORKER MRW ERROR] Excepción crítica: {e}")
+            time.sleep(5)
 
 # =========================================================
-# 🧹 BARREDOR ANTI-LIMBO (PÉGALO EXACTAMENTE AQUÍ)
+# 🧹 BARREDOR ANTI-LIMBO Y CRONJOB LOGÍSTICO
 # =========================================================
-from datetime import datetime, timezone
-
 def recuperador_ordenes_pendientes():
-    """Barredor Anti-Limbo que NO requiere índice compuesto de Firebase"""
-    logger.info("🧹 [SWEEPER] Hilo recuperador iniciado (Anti-Limbo).")
+    """Barredor Anti-Limbo y CronJob Logístico"""
+    logger.info("🧹 [SWEEPER] Hilo barredor iniciado (Pagos y Logística).")
     while True:
         try:
             time.sleep(60) 
             ahora_ts = datetime.now(timezone.utc).timestamp()
             
-            # Buscamos solo por estado para evitar errores de índices de Firebase
-            ordenes = db.collection('store_orders').where('status', '==', 'pending_retry').get()
-
-            for doc in ordenes:
+            # 1. 🧹 BARREDOR FINANCIERO (Anti-Limbo)
+            ordenes_pago = db.collection('store_orders').where('status', '==', 'pending_retry').get()
+            for doc in ordenes_pago:
                 order_id = doc.id
                 datos_orden = doc.to_dict()
-                
                 proximo = datos_orden.get('proximo_reintento')
                 if proximo:
-                    # Comparamos las fechas internamente en Python
                     proximo_ts = proximo.timestamp()
-                    
                     if proximo_ts <= ahora_ts:
                         payment_method = datos_orden.get('paymentMethod') or datos_orden.get('payment_method') or datos_orden.get('payment_details', {}).get('payment_method', '')
-                        
                         with lock_in_flight:
                             if order_id not in processed_in_flight:
                                 processed_in_flight.add(order_id)
-                                logger.info(f"🔄 [SWEEPER] Rescatando orden del limbo: {order_id}")
-                                
+                                logger.info(f"🔄 [SWEEPER] Rescatando orden de pago: {order_id}")
                                 if payment_method == 'pago_movil':
                                     pm_queue.put((order_id, datos_orden))
                                 elif payment_method == 'binance':
                                     binance_queue.put((order_id, datos_orden))
+
+            # 2. 🚚 CRONJOB LOGÍSTICO (14 Días Máximo / Chequeo 8 Horas)
+            ordenes_logistica = db.collection('store_orders').where('status', '==', 'enviado').get()
+            for doc in ordenes_logistica:
+                order_id = doc.id
+                datos_orden = doc.to_dict()
+                
+                ultima_rev = datos_orden.get('ultima_revision_mrw', 0)
+                # Si no tiene fecha de inicio, asumimos el momento actual para no cerrarla por error
+                fecha_inicio = datos_orden.get('fecha_inicio_tracking', ahora_ts) 
+                
+                # Convertimos la diferencia de segundos a días (86400 segundos = 1 día)
+                dias_transcurridos = (ahora_ts - fecha_inicio) / 86400 
+                
+                # 🛑 REGLA DE PROTECCIÓN AL VENDEDOR: Cierre automático a los 14 días
+                if dias_transcurridos >= 14:
+                    logger.info(f"⏳ [AUTO-CIERRE] Orden {order_id} superó 14 días en tránsito. Marcando como completada.")
+                    db.collection('store_orders').document(order_id).update({
+                        "status": "completado",
+                        "ubicacion_paquete": "Entregado (Cierre automático por tiempo máximo)"
+                    })
+                    continue # Terminamos aquí, ya no la encolamos para buscar en MRW
+                
+                # ⏱️ REGLA DE CONSULTA: Si no han pasado 14 días, revisamos cada 8 horas (28800 segundos)
+                if (ahora_ts - ultima_rev) > 28800:
+                    with lock_in_flight:
+                        if order_id not in processed_in_flight:
+                            processed_in_flight.add(order_id)
+                            logger.info(f"🚚 [CRONJOB] Chequeo logístico de 8H para: {order_id}")
+                            mrw_queue.put((order_id, datos_orden))
+
         except Exception as e:
             logger.error(f"❌ [SWEEPER ERROR] Fallo: {e}")
 
@@ -197,7 +229,6 @@ def recuperador_ordenes_pendientes():
 # =========================================================
 def on_snapshot(col_snapshot, changes, read_time):
     for change in changes:
-        # Ahora escuchamos cuando se CREAN y cuando se MODIFICAN (Ej: le agregaste la guía)
         if change.type.name in ['ADDED', 'MODIFIED']:
             order_id = change.document.id
             order_data = change.document.to_dict()
@@ -210,9 +241,15 @@ def on_snapshot(col_snapshot, changes, read_time):
 
             # --- RUTA LOGÍSTICA (MRW) ---
             if status == 'enviado' and order_data.get('nro_guia'):
-                logger.info(f"🚚 [FIRESTORE EVENT] Paquete en tránsito detectado: {order_id}")
-                mrw_queue.put((order_id, order_data))
-                continue # Terminamos aquí para esta orden
+                # 🚀 Si no tiene sello de tiempo, es nueva. Se procesa instantáneamente.
+                if not order_data.get('ultima_revision_mrw'):
+                    logger.info(f"🚚 [FIRESTORE EVENT] Nueva guía detectada, procesando en vivo: {order_id}")
+                    mrw_queue.put((order_id, order_data))
+                else:
+                    # Ya se revisó antes. Dejamos que el Barredor lo haga periódicamente (8 horas).
+                    with lock_in_flight:
+                        processed_in_flight.discard(order_id)
+                continue
 
             # --- RUTA FINANCIERA (Pagos) ---
             if status == 'pending_verification':
@@ -242,7 +279,7 @@ def start_bot_services():
     # Hilo logístico por Lotes para MRW
     threading.Thread(target=mrw_worker_loop, daemon=True).start()
 
-    # 🧹 EL NUEVO BARREDOR PARA EVITAR EL LIMBO (Universal: Pago Móvil y Binance)
+    # 🧹 EL NUEVO BARREDOR PARA EVITAR EL LIMBO (Universal: Pago Móvil, Binance y MRW)
     threading.Thread(target=recuperador_ordenes_pendientes, daemon=True).start()
 
     try:
