@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 # --- IMPORTACIÓN DE MÓDULOS ---
 import pago_movil_bot
 import binance_bot
+import mrw_bot
 
 load_dotenv()
 
@@ -62,6 +63,7 @@ db = firestore.client()
 # =========================================================
 pm_queue = queue.Queue()
 binance_queue = queue.Queue()
+mrw_queue = queue.Queue()
 processed_in_flight = set()
 lock_in_flight = threading.Lock()
 
@@ -100,6 +102,55 @@ def binance_worker_loop(worker_id):
             with lock_in_flight:
                 processed_in_flight.discard(order_id)
             binance_queue.task_done()
+
+def mrw_worker_loop():
+    """Hilo logístico para rastreo de MRW usando Batched Writes"""
+    logger.info("📦 [WORKER MRW] Hilo logístico iniciado.")
+    while True:
+        try:
+            # Esperamos acumular paquetes en la cola (o ejecutamos cada 5 minutos)
+            time.sleep(300) 
+            items = []
+            
+            # Vaciamos toda la cola actual
+            try:
+                while True:
+                    items.append(mrw_queue.get_nowait())
+            except queue.Empty:
+                pass
+
+            if items:
+                batch = db.batch() # <-- INICIAMOS EL LOTE DE ESCRITURA
+                requiere_escritura = False
+
+                for order_id, order_data in items:
+                    nro_guia = order_data.get('nro_guia')
+                    if nro_guia:
+                        resultado = mrw_bot.consultar_guia(nro_guia)
+
+                        if resultado.get("valido"):
+                            ref_doc = db.collection('store_orders').document(order_id)
+                            # Si ya se entregó, lo pasamos a completado. Si no, sigue enviado.
+                            nuevo_estatus = "completado" if resultado["estatus_actual"] == "Entregado" else "enviado"
+                            
+                            batch.update(ref_doc, {
+                                "status": nuevo_estatus,
+                                "historial_envio": resultado["historial"],
+                                "ubicacion_paquete": resultado["ubicacion_actual"]
+                            })
+                            requiere_escritura = True
+
+                    mrw_queue.task_done()
+                    with lock_in_flight:
+                        processed_in_flight.discard(order_id)
+
+                # Mandamos a guardar TODAS las guías en 1 sola operación a Firebase
+                if requiere_escritura:
+                    batch.commit()
+                    logger.info(f"✅ [BATCH WRITE] Se actualizaron {len(items)} envíos en Firestore simultáneamente.")
+
+        except Exception as e:
+            logger.error(f"❌ [WORKER MRW ERROR] Excepción crítica: {e}")
 
 # =========================================================
 # 🧹 BARREDOR ANTI-LIMBO (PÉGALO EXACTAMENTE AQUÍ)
@@ -146,28 +197,39 @@ def recuperador_ordenes_pendientes():
 # =========================================================
 def on_snapshot(col_snapshot, changes, read_time):
     for change in changes:
-        if change.type.name == 'ADDED':
+        # Ahora escuchamos cuando se CREAN y cuando se MODIFICAN (Ej: le agregaste la guía)
+        if change.type.name in ['ADDED', 'MODIFIED']:
             order_id = change.document.id
             order_data = change.document.to_dict()
+            status = order_data.get('status')
             
-            # Búsqueda robusta de método de pago
-            payment_method = order_data.get('paymentMethod') or order_data.get('payment_method') or order_data.get('payment_details', {}).get('payment_method', '')
-            
-            if payment_method not in ['pago_movil', 'binance']:
-                logger.info(f"⏭️ [LISTENER] Orden {order_id} ignorada. Método: '{payment_method}'")
-                continue 
-
             with lock_in_flight:
                 if order_id in processed_in_flight:
                     continue
                 processed_in_flight.add(order_id)
 
-            logger.info(f"⚡ [FIRESTORE EVENT] Nueva orden encolada ({payment_method}): {order_id}")
-            
-            if payment_method == 'pago_movil':
-                pm_queue.put((order_id, order_data))
-            elif payment_method == 'binance':
-                binance_queue.put((order_id, order_data))
+            # --- RUTA LOGÍSTICA (MRW) ---
+            if status == 'enviado' and order_data.get('nro_guia'):
+                logger.info(f"🚚 [FIRESTORE EVENT] Paquete en tránsito detectado: {order_id}")
+                mrw_queue.put((order_id, order_data))
+                continue # Terminamos aquí para esta orden
+
+            # --- RUTA FINANCIERA (Pagos) ---
+            if status == 'pending_verification':
+                payment_method = order_data.get('paymentMethod') or order_data.get('payment_method') or order_data.get('payment_details', {}).get('payment_method', '')
+                
+                if payment_method == 'pago_movil':
+                    logger.info(f"⚡ [FIRESTORE EVENT] Pago Móvil encolado: {order_id}")
+                    pm_queue.put((order_id, order_data))
+                elif payment_method == 'binance':
+                    logger.info(f"⚡ [FIRESTORE EVENT] Binance encolado: {order_id}")
+                    binance_queue.put((order_id, order_data))
+                else:
+                    with lock_in_flight:
+                        processed_in_flight.discard(order_id)
+            else:
+                with lock_in_flight:
+                    processed_in_flight.discard(order_id)
 
 def start_bot_services():
     # Hilo exclusivo para Pago Móvil
