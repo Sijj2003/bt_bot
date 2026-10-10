@@ -239,14 +239,18 @@ def start_bot_services():
     for i in range(3):
         threading.Thread(target=binance_worker_loop, args=(i+1,), daemon=True).start()
 
+    # Hilo logístico por Lotes para MRW
+    threading.Thread(target=mrw_worker_loop, daemon=True).start()
+
     # 🧹 EL NUEVO BARREDOR PARA EVITAR EL LIMBO (Universal: Pago Móvil y Binance)
     threading.Thread(target=recuperador_ordenes_pendientes, daemon=True).start()
 
     try:
         logger.info("🚀 [BOT] Iniciando Listener de Firestore para 'store_orders'...")
-        orders_ref = db.collection('store_orders').where('status', '==', 'pending_verification')
+        # Modificado para escuchar ambos estados ('pending_verification' y 'enviado')
+        orders_ref = db.collection('store_orders').where('status', 'in', ['pending_verification', 'enviado'])
         orders_ref.on_snapshot(on_snapshot)
-        logger.info("✅ [BOT] Listener activo y escuchando compras pendientes.")
+        logger.info("✅ [BOT] Listener activo y escuchando compras pendientes y envíos logísticos.")
     except Exception as e:
         logger.error(f"❌ [BOT ERROR] Falló al iniciar el Listener de Firestore: {e}")
 
