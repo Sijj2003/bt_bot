@@ -105,7 +105,8 @@ def binance_worker_loop(worker_id):
             binance_queue.task_done()
 
 def mrw_worker_loop():
-    """Hilo logístico para rastreo de MRW usando Batched Writes"""
+    """Hilo logístico para rastreo de MRW usando Batched Writes y Validación de Identidad Anti-Fraude"""
+    import re
     logger.info("📦 [WORKER MRW] Hilo logístico iniciado.")
     while True:
         try:
@@ -129,25 +130,90 @@ def mrw_worker_loop():
                     nro_guia = odata.get('nro_guia')
                     if nro_guia:
                         resultado = mrw_bot.consultar_guia(nro_guia)
+                        ref_doc = db.collection('store_orders').document(oid)
 
                         if resultado.get("valido"):
-                            ref_doc = db.collection('store_orders').document(oid)
-                            nuevo_estatus = "completado" if resultado["estatus_actual"] == "Entregado" else "enviado"
+                            # ========================================================
+                            # 🛡️ VALIDACIÓN DE IDENTIDAD ZERO-TRUST (Nombre y Cédula)
+                            # ========================================================
+                            mrw_destinatario = resultado.get("destinatario", "").upper()
+                            buyer_name = str(odata.get("buyer_name", "")).upper()
+                            buyer_doc = str(odata.get("buyer_doc", ""))
                             
-                            # Preparamos el paquete de actualización
-                            update_data = {
-                                "status": nuevo_estatus,
-                                "historial_envio": resultado["historial"],
-                                "ubicacion_paquete": resultado["ubicacion_actual"],
-                                "ultima_revision_mrw": ahora_ts  # ⏱️ Sello de la última revisión
-                            }
+                            es_autentica = True
                             
-                            # 📅 Si es la primera vez que se revisa, sellamos el inicio del tracking
-                            if not odata.get('fecha_inicio_tracking'):
-                                update_data['fecha_inicio_tracking'] = ahora_ts
+                            # Si MRW devolvió un nombre real (no está vacío) procedemos a auditar
+                            if mrw_destinatario and len(mrw_destinatario) > 3:
+                                # 1. Auditar Cédula: Extraemos solo los números de la CI del cliente
+                                doc_digits = re.sub(r'\D', '', buyer_doc)
+                                coincide_cedula = bool(doc_digits) and (doc_digits in mrw_destinatario)
+                                
+                                # 2. Auditar Nombre: Buscamos si alguna palabra del nombre (>3 letras) está en MRW
+                                palabras_nombre = [p for p in buyer_name.split() if len(p) > 3]
+                                coincide_nombre = any(p in mrw_destinatario for p in palabras_nombre)
+                                
+                                # Si ni la cédula ni el nombre cruzaron información, es una guía de otro cliente
+                                if not (coincide_cedula or coincide_nombre):
+                                    es_autentica = False
                             
-                            batch.update(ref_doc, update_data)
-                            requiere_escritura = True
+                            if es_autentica:
+                                # ✅ GUÍA VERÍDICA Y CONFIRMADA: Actualizamos historial
+                                nuevo_estatus = "completado" if resultado["estatus_actual"] == "Entregado" else "enviado"
+                                update_data = {
+                                    "status": nuevo_estatus,
+                                    "historial_envio": resultado["historial"],
+                                    "ubicacion_paquete": resultado["ubicacion_actual"],
+                                    "ultima_revision_mrw": ahora_ts
+                                }
+                                if not odata.get('fecha_inicio_tracking'):
+                                    update_data['fecha_inicio_tracking'] = ahora_ts
+                                    
+                                batch.update(ref_doc, update_data)
+                                requiere_escritura = True
+                            else:
+                                # 🚨 FRAUDE DETECTADO: Revertimos la acción y borramos la guía
+                                logger.warning(f"🚨 [FRAUDE DETECTADO] Guía {nro_guia} rechazada. Le pertenece a {mrw_destinatario}, no a {buyer_name}.")
+                                bad_store = None
+                                guide_obj_to_remove = None
+                                # Buscamos qué partner inyectó esta guía falsa
+                                for s_name, s_data in odata.get('store_splits', {}).items():
+                                    for g in s_data.get('tracking_guides', []):
+                                        if g.get('guide_number') == str(nro_guia):
+                                            bad_store = s_name
+                                            guide_obj_to_remove = g
+                                            break
+                                
+                                if bad_store:
+                                    batch.update(ref_doc, {
+                                        "status": "processing",  # ⬅️ Devuelve la orden a la pantalla del Partner
+                                        "nro_guia": firestore.DELETE_FIELD,
+                                        f"store_splits.{bad_store}.shipping_status": "pending",
+                                        f"store_splits.{bad_store}.tracking_guides": firestore.ArrayRemove([guide_obj_to_remove]),
+                                        f"store_splits.{bad_store}.fraud_alert": f"Rechazada por Bot: La guía {nro_guia} le pertenece a {mrw_destinatario}."
+                                    })
+                                    requiere_escritura = True
+
+                        else:
+                            # 🚨 LA GUÍA NO EXISTE O ES FALSA
+                            logger.warning(f"🚨 [GUÍA FALSA] {nro_guia} no está registrada en MRW.")
+                            bad_store = None
+                            guide_obj_to_remove = None
+                            for s_name, s_data in odata.get('store_splits', {}).items():
+                                for g in s_data.get('tracking_guides', []):
+                                    if g.get('guide_number') == str(nro_guia):
+                                        bad_store = s_name
+                                        guide_obj_to_remove = g
+                                        break
+                            
+                            if bad_store:
+                                batch.update(ref_doc, {
+                                    "status": "processing",
+                                    "nro_guia": firestore.DELETE_FIELD,
+                                    f"store_splits.{bad_store}.shipping_status": "pending",
+                                    f"store_splits.{bad_store}.tracking_guides": firestore.ArrayRemove([guide_obj_to_remove]),
+                                    f"store_splits.{bad_store}.fraud_alert": "Rechazada por Bot: La guía ingresada no existe en el sistema de MRW."
+                                })
+                                requiere_escritura = True
 
                     mrw_queue.task_done()
                     with lock_in_flight:
@@ -155,12 +221,12 @@ def mrw_worker_loop():
 
                 if requiere_escritura:
                     batch.commit()
-                    logger.info(f"✅ [BATCH WRITE] Se actualizaron {len(items)} envíos logísticos en Firestore.")
+                    logger.info(f"✅ [BATCH WRITE] Operaciones logísticas procesadas en Firebase.")
 
         except Exception as e:
             logger.error(f"❌ [WORKER MRW ERROR] Excepción crítica: {e}")
             time.sleep(5)
-
+            
 # =========================================================
 # 🧹 BARREDOR ANTI-LIMBO Y CRONJOB LOGÍSTICO
 # =========================================================
